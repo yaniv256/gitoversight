@@ -1,0 +1,45 @@
+[Unit]
+Description=Git Oversight optional notification dispatcher
+After=network-online.target gitoversight-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gitoversight-notify
+Group=gitoversight-notify
+SupplementaryGroups=gitoversight-notifications
+StateDirectory=gitoversight-notify
+StateDirectoryMode=0700
+ExecStart=/usr/local/libexec/gitoversight-notify -config /etc/gitoversight/notify.json
+LoadCredential=notification-token:/etc/gitoversight-secrets/notifications/token
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/run/gitoversight-notifications /var/lib/gitoversight-notify
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

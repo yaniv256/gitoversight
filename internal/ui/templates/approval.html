@@ -1,0 +1,49 @@
+{{define "content"}}
+<h1 class="large">Approval</h1>
+<div id="banner" class="banner"></div>
+<div class="card">
+  <span class="chip">{{.Op.Kind}}</span>
+  <p style="font-size:19px;font-weight:650;margin:10px 0 2px">{{.Op.Repository}}</p>
+  <p class="muted" style="margin:0 0 4px">Requested by agent <b>{{.Op.AgentID}}</b></p>
+
+  {{/* What happens on GitHub if this is approved, in one sentence. The approver
+       should never have to infer the effect from an operation kind. */}}
+  <p style="font-weight:650;margin:10px 0 2px">{{.Approval.Effect}}</p>
+  {{if .Approval.TargetURL}}
+  <p style="margin:0 0 8px"><a href="{{.Approval.TargetURL}}" target="_blank" rel="noopener">Open {{.Approval.TargetLabel}} on GitHub ↗</a></p>
+  {{end}}
+
+  {{if .Approval.ProposedTitle}}
+  <p class="muted" style="margin:8px 0 2px;font-size:14px">Title:</p>
+  <p style="font-weight:650;margin:0 0 6px">{{.Approval.ProposedTitle}}</p>
+  {{end}}
+
+  {{/* The published text, verbatim. This is the whole point of the page: a
+       human cannot meaningfully authorize a publication they cannot read.
+       Rendered as TEXT — the body is agent-authored, and html/template escapes
+       it. Never cast this to template.HTML to render markdown. */}}
+  {{if .Approval.Published}}
+  <p class="muted" style="margin:8px 0 2px;font-size:14px">{{.Approval.PublishedLabel}}:</p>
+  <div class="proposal">{{.Approval.Published}}</div>
+  {{end}}
+
+  {{if .Approval.Ref}}
+  <p class="muted" style="margin:8px 0 4px;font-size:14px">Ref: {{.Approval.Ref}}</p>
+  {{end}}
+
+  <p class="faint" style="font-size:13px;margin:0 0 14px">Packet {{printf "%.16s" .Op.PacketHash}}… · expires {{.Op.ApprovalExpiresAt.Format "15:04 MST"}}</p>
+
+  {{if eq .Op.State "awaiting_approval"}}
+  <div class="actions">
+    <button class="btn" data-action="approve" data-url="/v1/reviews/{{.Op.ID}}/approve" data-body="{{.ApproveBody}}" data-confirm="Approve {{.Op.Kind}} on {{.Op.Repository}}?">Approve</button>
+    {{/* Declining is a first-class outcome. Without it the only way to refuse
+         is to let the approval expire, which is indistinguishable from
+         inattention in the audit trail. */}}
+    <button class="btn secondary" data-action="decline" data-url="/v1/reviews/{{.Op.ID}}/decline" data-body='{}' data-confirm="Decline this action? The agent will not publish it.">Decline</button>
+  </div>
+  <p class="faint" style="font-size:13px;margin-top:10px">Approving executes the operation once through the governed worker. Everything is receipted.</p>
+  {{else}}
+  <p class="muted">This operation is <span class="chip">{{.Op.State}}</span> — nothing to approve here.</p>
+  {{end}}
+</div>
+{{end}}

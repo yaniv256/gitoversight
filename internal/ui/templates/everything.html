@@ -1,0 +1,48 @@
+{{define "content"}}
+<h1 class="large">Everything</h1>
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+  <p class="faint" style="flex:1;margin:0;font-size:13px">{{if .LastSync}}synced {{.LastSync}}{{else}}not synced yet{{end}}</p>
+  {{if not .NotConfigured}}<button class="btn secondary" style="width:auto;padding:8px 14px;font-size:14px" data-action="search-refresh" data-url="/v1/human/search/refresh">Refresh</button>{{end}}
+</div>
+<div id="banner" class="banner"></div>
+{{if .NotConfigured}}
+<div class="card">
+  <p class="muted" style="margin:0">The search dataset is not configured — set <code>search_db_path</code> in the worker and API configuration to enable it.</p>
+</div>
+{{else if .SearchError}}
+<div class="card">
+  <p class="muted" style="margin:0"><span class="chip deny">unavailable</span> The repo dataset could not be read — this is not the index building; check the server log.</p>
+</div>
+{{else if .IndexBuilding}}
+<div class="card">
+  <p class="muted" style="margin:0">The repo dataset is not built yet — it fills in after the first sync. Refresh triggers one.</p>
+</div>
+{{end}}
+{{if not .Repos}}
+<div class="empty">
+  <div class="big">No repositories to show.</div>
+  <div>Registered repositories appear here once the dataset syncs.</div>
+</div>
+{{end}}
+{{range .Repos}}
+<div class="card">
+  <p style="font-weight:700;margin:0 0 10px">{{.Name}}</p>
+  {{if .NotSynced}}
+  <p class="muted" style="margin:0"><span class="chip">not synced yet</span> appears after the next dataset sync</p>
+  {{else if not .Pulls}}
+  <p class="faint" style="margin:0">No open pull requests.</p>
+  {{else}}
+  {{range .Pulls}}
+  <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)">
+    <div style="flex:1;min-width:0">
+      <p style="margin:0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{.Title}}</p>
+      <p class="faint" style="margin:2px 0 0;font-size:13px">#{{.Number}} · {{.Author}}</p>
+    </div>
+    <span class="chip{{if .Deny}} deny{{end}}">{{.Chip}}</span>
+    <a class="btn secondary" style="width:auto;padding:8px 14px;font-size:14px" href="{{.HTMLURL}}">Open ↗</a>
+  </div>
+  {{end}}
+  {{end}}
+</div>
+{{end}}
+{{end}}

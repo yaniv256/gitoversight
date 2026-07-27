@@ -1,0 +1,21 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="csrf-token" content="{{.CSRFToken}}">
+<title>{{.Title}} · GitOversight</title>
+<link rel="stylesheet" href="/ui/static/styles.css">
+<script src="/ui/static/app.js" defer></script>
+</head>
+<body>
+<main class="page">
+{{template "content" .}}
+</main>
+<nav class="tabbar" aria-label="Views">
+  <a href="/ui/now" {{if eq .Tab "now"}}class="active"{{end}}><span class="ic">◉</span>Now</a>
+  <a href="/ui/everything" {{if eq .Tab "everything"}}class="active"{{end}}><span class="ic">☰</span>Everything</a>
+  <a href="/ui/search" {{if eq .Tab "search"}}class="active"{{end}}><span class="ic">⌕</span>Search</a>
+</nav>
+</body>
+</html>{{end}}

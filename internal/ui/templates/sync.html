@@ -1,0 +1,175 @@
+{{define "content"}}
+<h1 class="large">{{.Sync.PublicRepository}}</h1>
+<div id="banner" class="banner"></div>
+<div class="card">
+  <ol class="rail">
+    <li class="done"><span class="dot"></span>Proposed by {{.Sync.CreatedBy}}</li>
+    <li class="{{railClass .Sync.State "proposed"}}"><span class="dot"></span>Your review</li>
+    <li class="{{railClass .Sync.State "authorized"}}"><span class="dot"></span>Publishing</li>
+    <li class="{{railClass .Sync.State "public_pr_created"}}"><span class="dot"></span>Your merge on GitHub</li>
+    <li class="{{railClass .Sync.State "done"}}"><span class="dot"></span>Done</li>
+  </ol>
+
+  {{if eq .Sync.State "proposed"}}
+  {{/* Warnings and refusals come FIRST. A safety signal below the fold is not
+       a safety signal: on a phone the reviewer would scroll past 40 files and
+       reach the Authorize button before ever seeing it. */}}
+
+  {{/* Revision provenance. The loop always worked — Request changes, the agent
+       resubmits — but the page rendered the new proposal identically to a first
+       one, so the reviewer re-read it cold with no record of the change they
+       themselves had asked for. Guarded on Revision so a FIRST proposal grows
+       no banner; the common case must stay quiet. */}}
+  {{if .Provenance.Revision}}
+  <div class="notice">
+    <strong>Revision {{.Provenance.Revision}}</strong> — the agent resubmitted after your review.
+    {{if .Provenance.LatestChangeNote}}
+    <p class="muted" style="margin:6px 0 2px;font-size:14px">You asked for:</p>
+    <div class="proposal">{{.Provenance.LatestChangeNote}}</div>
+    {{end}}
+  </div>
+  {{end}}
+  {{if .View.Unavailable}}
+  <div class="notice deny"><strong>Cannot show this change.</strong> {{.View.Unavailable}}</div>
+  {{end}}
+  {{range .View.Warnings}}
+  <div class="notice warn">{{.}}</div>
+  {{end}}
+
+  <p class="submitter">
+    Submitted by <strong>{{.Sync.CreatedBy}}</strong>
+    <span class="muted">· governance identity, verified by the broker</span>
+  </p>
+
+  <p style="font-weight:650;margin:14px 0 2px">Proposed pull request</p>
+  <div class="proposal">{{.Sync.ProposalText}}</div>
+
+  {{if not .View.Unavailable}}
+  <div class="difftotals">
+    <strong>{{len .View.Files}}</strong> file{{if ne (len .View.Files) 1}}s{{end}} changed
+    <span class="plus">+{{.View.TotalAdded}}</span>
+    <span class="minus">&minus;{{.View.TotalRemoved}}</span>
+    {{if .View.AddedFiles}}<span class="chip">{{.View.AddedFiles}} added</span>{{end}}
+    {{if .View.ModifiedFiles}}<span class="chip">{{.View.ModifiedFiles}} modified</span>{{end}}
+    {{if .View.DeletedFiles}}<span class="chip deny">{{.View.DeletedFiles}} deleted</span>{{end}}
+    {{if .View.SubmoduleFiles}}<span class="chip">{{.View.SubmoduleFiles}} submodule</span>{{end}}
+  </div>
+
+  {{range .View.Files}}
+  <details class="filediff" {{if $.View.AutoExpand}}open{{end}} id="f-{{.Path}}">
+    <summary>
+      <span class="fpath">{{.Path}}</span>
+      <span class="fmeta">
+        {{if .Sensitive}}<span class="chip deny">sensitive</span>{{end}}
+        <span class="chip">{{kindLabel .Kind}}</span>
+        {{if .Added}}<span class="plus">+{{.Added}}</span>{{end}}
+        {{if .Removed}}<span class="minus">&minus;{{.Removed}}</span>{{end}}
+      </span>
+    </summary>
+    {{if .Binary}}
+    <p class="muted diffnote">Binary file — not shown as text.</p>
+    {{else if eq (printf "%s" .Kind) "submodule"}}
+    <p class="muted diffnote">Submodule pointer moves from <code>{{.OldSHA}}</code> to <code>{{.NewSHA}}</code>.</p>
+    {{else if .Truncated}}
+    <p class="muted diffnote">This diff is too large to display ({{.Added}} added, {{.Removed}} removed). The file is still part of this change and was scanned for private identifiers.</p>
+    {{else}}
+    {{range .Hunks}}
+    <div class="diff">
+      <div class="hunk">{{.Header}}</div>
+      {{range .Lines}}<div class="dl {{lineClass .Op}}">{{printf "%c" .Op}}{{.Text}}</div>{{end}}
+    </div>
+    {{end}}
+    {{end}}
+  </details>
+  {{end}}
+  {{end}}
+
+  <div class="actions">
+    <button class="btn" data-action="authorize" data-url="/v1/human/sync/{{.Sync.ID}}/authorize" data-body='{"packet_hash":"{{.Sync.ProposalHash}}"}' data-confirm="Open a public pull request on {{.Sync.PublicRepository}}? This page will show the result either way.">Authorize publication</button>
+    <button class="btn secondary" data-action="request-changes" data-url="/v1/human/sync/{{.Sync.ID}}/request-changes" data-body-id="change-note">Request changes</button>
+    {{/* Parity with GitHub: a reviewer can close what they do not want. Before
+         this the only options were approve or leave it in the queue forever,
+         which is an absence of a decision rather than a decision — and the
+         audit trail cannot tell those apart. */}}
+    <button class="btn secondary" data-action="close" data-url="/v1/human/sync/{{.Sync.ID}}/close" data-body-id="change-note" data-confirm="Close this pre-PR? The agent will not publish it. Nothing reaches {{.Sync.PublicRepository}}.">Close without publishing</button>
+  </div>
+  <label class="notelabel" for="change-note">What should change? (sent to the agent)</label>
+  <textarea id="change-note" class="note" rows="3" placeholder="e.g. drop the vendored binary, and reword the second paragraph"></textarea>
+
+  {{else if eq .Sync.State "changes_requested"}}
+  <p class="muted">You asked for changes — the agent is revising. This page updates when the new proposal lands.</p>
+  <div class="actions">
+    <button class="btn secondary" data-action="close" data-url="/v1/human/sync/{{.Sync.ID}}/close" data-body='{}' data-confirm="Close this pre-PR? The agent will stop revising and nothing reaches {{.Sync.PublicRepository}}.">Close without publishing</button>
+  </div>
+
+  {{else if eq .Sync.State "closed"}}
+  {{/* Without this branch a closed pre-PR falls into the final {{else}} and the
+       page says "This sync is complete" — the opposite of the truth, and the
+       third time that trap would have fired in this plan. */}}
+  <p style="font-weight:650;margin:0 0 2px">Closed without publishing</p>
+  <p class="muted">You closed this pre-PR, so nothing from it reached {{.Sync.PublicRepository}}. The discussion below stays open — a closed pre-PR is still discussable.</p>
+
+  {{else if eq .Sync.State "authorized"}}
+  <p style="font-weight:650;margin:0 0 2px">Approved publication</p>
+  <div class="proposal">{{.Sync.AuthorizedText}}</div>
+  <p class="muted" style="margin:8px 0 4px;font-size:14px">Files publishing:</p>
+  <ul class="files">{{range .Sync.FileManifest}}<li>{{.}}</li>{{end}}</ul>
+  <p class="muted">Publishing normally completes while you watch. If this page still says Publishing after a reload, the publish was interrupted — Retry resumes it safely from wherever it stopped (nothing is done twice).</p>
+  <div class="actions">
+    {{/* The reviewer's next question after approving is always "where is it?".
+         Until the PR number exists there is no link to give, so offer the repo's
+         pull-request list — a real destination beats a dead end, and it is the
+         page the PR will appear on. */}}
+    <a class="btn secondary" href="https://github.com/{{.Sync.PublicRepository}}/pulls" target="_blank" rel="noopener">Check {{.Sync.PublicRepository}} on GitHub ↗</a>
+    <button class="btn" data-action="authorize" data-url="/v1/human/sync/{{.Sync.ID}}/authorize" data-body='{"packet_hash":"{{.Sync.ProposalHash}}"}' data-confirm="Resume publishing to {{.Sync.PublicRepository}}?">Retry publishing</button>
+  </div>
+
+  {{else if eq .Sync.State "public_pr_created"}}
+  <p class="muted" style="margin-bottom:12px">The public pull request is open. Merge it on GitHub, then come back and tap Done.</p>
+  <div class="actions">
+    <a class="btn" href="https://github.com/{{.Sync.PublicRepository}}/pull/{{.Sync.PublicPRNumber}}" target="_blank" rel="noopener">Open PR #{{.Sync.PublicPRNumber}} on GitHub ↗</a>
+    <button class="btn secondary" data-action="done" data-url="/v1/human/sync/{{.Sync.ID}}/done" data-body='{}'>I merged it — Done</button>
+  </div>
+
+  {{else if eq .Sync.State "abandoned"}}
+  {{/* Without this branch an abandoned sync falls into the {{else}} below and
+       the page says "This sync is complete" — asserting the opposite of the
+       truth. A confident-wrong message is worse than an error: it ends the
+       reviewer's investigation before it starts. */}}
+  <p style="font-weight:650;margin:0 0 2px">Closed without merging</p>
+  <p class="muted" style="margin:0 0 12px">Pull request #{{.Sync.PublicPRNumber}} was closed on GitHub without being merged, so nothing from this pre-PR reached {{.Sync.PublicRepository}}. Ask the agent to propose a new pre-PR if the change is still wanted.</p>
+  <div class="actions">
+    <a class="btn secondary" href="https://github.com/{{.Sync.PublicRepository}}/pull/{{.Sync.PublicPRNumber}}" target="_blank" rel="noopener">See PR #{{.Sync.PublicPRNumber}} on GitHub ↗</a>
+  </div>
+
+  {{else}}
+  <p class="muted">This sync is complete. <span class="chip">Done</span></p>
+  {{end}}
+</div>
+
+{{/* The discussion thread. Outside the state branches on purpose: a pre-PR
+     stays discussable in every state, including terminal ones — the same way a
+     closed pull request on GitHub still takes comments. Losing the ability to
+     say "here is why we abandoned this" the moment it is abandoned would
+     discard the most useful comment on the whole thread. */}}
+<div class="card">
+  <p style="font-weight:650;margin:0 0 8px">Discussion</p>
+  {{if .Comments}}
+  {{range .Comments}}
+  <p class="muted" style="margin:10px 0 2px;font-size:14px">
+    {{if eq .AuthorKind "agent"}}Agent <b>{{.AuthorID}}</b>{{else}}<b>{{.AuthorID}}</b>{{end}}
+  </p>
+  {{/* Rendered as TEXT. Comment bodies are agent- and human-authored free
+       text; html/template escapes them. Never cast to template.HTML. */}}
+  <div class="proposal">{{.Body}}</div>
+  {{end}}
+  {{else}}
+  <p class="muted" style="margin:0 0 10px">No comments yet. Agents can review each other's pre-PRs here before you weigh in.</p>
+  {{end}}
+  <label class="notelabel" for="comment-body">Add a comment</label>
+  <textarea id="comment-body" class="note" rows="3" placeholder="e.g. this duplicates the guard in U4 — worth folding together?"></textarea>
+  <div class="actions">
+    <button class="btn secondary" data-action="comment" data-url="/v1/human/sync/{{.Sync.ID}}/comment" data-body-id="comment-body">Comment</button>
+  </div>
+</div>
+{{end}}

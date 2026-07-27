@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitoversight.com/schemas/request.v1.json",
+  "title": "Git Oversight broker request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "action": {"enum": ["authorize", "receipt", "revoke"]},
+    "request_id": {"type": "string", "minLength": 1},
+    "caller": {"type": "string"},
+    "capability": {"type": "string", "minLength": 1},
+    "repository": {"type": "string", "pattern": "^[^*/?\\[]+/[^*/?\\[]+$"},
+    "operation": {"enum": ["repository.read", "branch.push", "pull_request.create", "pull_request.update", "pull_request.review", "pull_request.reply", "pull_request.merge", "repository.create", "repository.settings.update", "installation.repository.add", "policy.promote", "release.publish", "issue.create", "issue.comment"]},
+    "branch": {"type": "string", "minLength": 1},
+    "title": {"type": "string"}, "body": {"type": "string"},
+    "approval_id": {"type": "string"}, "manifest_hash": {"type": "string"},
+    "payload": {"type": "object"}
+  },
+  "allOf": [
+    {"if": {"properties": {"action": {"enum": ["authorize"]}}}, "then": {"required": ["repository", "operation"]}},
+    {"if": {"required": ["action"], "properties": {"action": {"const": "revoke"}}}, "then": {"required": ["capability"]}}
+  ]
+}

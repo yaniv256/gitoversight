@@ -1,0 +1,20 @@
+{{define "content"}}
+<h1 class="large">Policy update</h1>
+<div id="banner" class="banner"></div>
+{{if .PromoteBody}}
+<div class="card">
+  <span class="chip">generation {{.PromoteFrom}} → {{.PromoteTo}}</span>
+  <p style="font-size:18px;font-weight:650;margin:12px 0 6px">{{.PromoteSummary}}</p>
+  <p class="muted" style="margin:0 0 14px">Reviewed against the active policy (hash-bound) — if anything changed underneath, this promotion is rejected untouched.</p>
+  <div class="actions">
+    <button class="btn" data-action="promote" data-url="/v1/policy" data-body-id="promote-body" data-confirm="Promote the policy to generation {{.PromoteTo}}?">Promote policy</button>
+  </div>
+  <script type="application/json" id="promote-body">{{.PromoteBody}}</script>
+</div>
+{{else}}
+<div class="empty">
+  <div class="big">No policy update staged.</div>
+  <div>When an agent stages a proposed policy, it appears here for your approval.</div>
+</div>
+{{end}}
+{{end}}

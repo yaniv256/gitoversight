@@ -1,0 +1,24 @@
+{
+  "generation": 2,
+  "agents": {
+    "agent-one": {"uid": 1000, "first_name": "AgentOne", "emails": []},
+    "agent-two": {"uid": 1001, "first_name": "AgentTwo", "emails": []},
+    "agent-three": {"uid": 1002, "first_name": "AgentThree", "emails": []}
+  },
+  "repositories": {
+    "example-org/product.test-public": {"visibility": "public", "owners": ["agent-one"], "writers": ["agent-one"], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/product.test-public.dev": {"visibility": "private", "owners": ["agent-one"], "writers": ["agent-one"], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/product.test-private": {"visibility": "private", "owners": ["agent-one"], "writers": ["agent-one"], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/product.dev": {"visibility": "private", "owners": ["agent-one"], "writers": [], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/tooling.dev": {"visibility": "private", "owners": ["agent-one"], "writers": [], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/service-a": {"visibility": "private", "owners": ["agent-one"], "writers": [], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/service-b": {"visibility": "private", "owners": ["agent-one"], "writers": [], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false},
+    "example-org/handbook": {"visibility": "private", "owners": ["agent-one"], "writers": [], "approvers": ["owner"], "standing_exceptions": [], "protected_policy": false}
+  },
+  "branch_grants": [
+    {"repository": "example-org/product.test-private", "agent": "agent-two", "branch": "agent/agent-two-acceptance", "active": true},
+    {"repository": "example-org/handbook", "agent": "agent-two", "branch": "agent/agent-two", "active": true},
+    {"repository": "example-org/service-a", "agent": "agent-three", "branch": "agent/agent-three", "active": true},
+    {"repository": "example-org/service-b", "agent": "agent-three", "branch": "agent/agent-three", "active": true}
+  ]
+}

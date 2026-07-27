@@ -1,0 +1,35 @@
+{
+	admin 127.0.0.1:2019
+	email {$ACME_EMAIL}
+}
+
+{$GITOVERSIGHT_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	@app_bootstrap path /bootstrap/github-app/register /bootstrap/github-app/callback
+	reverse_proxy @app_bootstrap 127.0.0.1:17446 {
+		header_up Host {http.request.host}
+		header_up -Forwarded
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Host
+		header_up -X-Forwarded-Proto
+		header_up -X-Original-Host
+		header_up -X-Original-URL
+	}
+	reverse_proxy 127.0.0.1:17445 {
+		header_up Host {http.request.host}
+		header_up -Forwarded
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Host
+		header_up -X-Forwarded-Proto
+		header_up -X-Original-Host
+		header_up -X-Original-URL
+		health_uri /livez
+		health_interval 30s
+	}
+}

@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # -count=1 disables the test cache. This suite has concurrency tests whose
+      # value comes from actually running; a cached "ok" proves nothing about
+      # the build under review.
+      - name: Test
+        run: go test -count=1 ./...
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The broker's correctness depends on exactly-once execution-grant
+      # consumption under concurrent workers. That is precisely the class of bug
+      # the race detector finds and ordinary runs miss.
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+  private-identity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repository exists to keep private identity out of public view, so
+      # it should not leak any itself. Test fixtures reach for a real mailbox or
+      # an internal hostname easily, and a one-off scan before publication only
+      # proves the tree was clean that day. Asserting the property on every
+      # change is what keeps it true.
+      #
+      # Use documentation-reserved names instead: example.com / example.org /
+      # example.test (RFC 2606) and the RFC 5737 address ranges.
+      # Scoped to code, schemas, and config rather than the whole tree: prose
+      # under docs/ legitimately quotes these names when describing what was
+      # scrubbed and why, and a guard that cannot distinguish a fixture from its
+      # own changelog gets disabled the first time it cries wolf.
+      - name: No private identity in code or config
+        run: |
+          # --untracked matters when this is run locally before committing: git
+          # grep searches the index by default, so a new file would pass the
+          # check right up until CI saw it.
+          patterns='babel3\.com|hey-code\.ai|seethegalaxy\.com'
+          if git grep --untracked -nIE "$patterns" -- '*.go' '*.json' '*.yml' '*.yaml' '*.sh' \
+               ':!.github/workflows/ci.yml'; then
+            echo
+            echo "Found a private hostname or mailbox above."
+            echo "Replace it with a documentation-reserved name (RFC 2606):"
+            echo "  example.com / example.org / example.test"
+            exit 1
+          fi
+          echo "No private identity found in code or config."

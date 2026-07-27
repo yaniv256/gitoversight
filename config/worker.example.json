@@ -1,0 +1,30 @@
+{
+  "worker_id": "ec2-worker-1",
+  "socket": "/run/gitoversight-worker/worker.sock",
+  "git_read_socket": "/run/gitoversight-worker/git-read.sock",
+  "github_git_base_url": "https://github.com",
+  "authority_socket": "/run/gitoversight-authority/authority.sock",
+  "broker_uid": 992,
+  "github_base_url": "https://api.github.com",
+  "github_oauth_base_url": "https://github.com",
+  "github_oauth_redirect_uri": "https://gitoversight.com/oauth/github/callback",
+  "github_app_client_id": "Iv1.replace-with-client-id",
+  "github_app_client_secret_file": "/run/credentials/gitoversight-worker.service/github-app-client-secret",
+  "github_app_private_key_file": "/run/credentials/gitoversight-worker.service/github-app-private-key",
+  "installations": {
+    "example/gitoversight.dev": 12345678,
+    "example-organization/*": 23456789
+  },
+  "human_installations": {
+    "ExampleGitHubLogin": 12345678
+  },
+  "http_timeout": "15s",
+  "vault_path": "/var/lib/gitoversight-worker/tokens.enc",
+  "vault_key_file": "/run/credentials/gitoversight-worker.service/vault-key",
+  "oauth_max_concurrent": 16,
+  "repositories": {
+    "example/gitoversight.dev": "private"
+  },
+  "search_db_path": "/var/lib/gitoversight-search/search.db",
+  "search_sync_interval": "1h"
+}

@@ -1,0 +1,42 @@
+[Unit]
+Description=Git Oversight one-shot App manifest bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/sbin/gitoversight-serve-app-bootstrap
+RuntimeMaxSec=15m
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/etc/gitoversight/app-bootstrap /etc/gitoversight/app-bootstrap.digest
+ReadWritePaths=/etc/gitoversight-secrets
+UMask=0077
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
