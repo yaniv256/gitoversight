@@ -1,0 +1,18 @@
+{
+  "generation": 1,
+  "agents": {
+    "builder": {"uid": 1002, "first_name": "Avery", "emails": ["builder@example.invalid"]},
+    "reviewer": {"uid": 1005, "first_name": "Robin", "emails": []}
+  },
+  "repositories": {
+    "example/gitoversight.dev": {
+      "visibility": "private",
+      "owners": ["builder"],
+      "writers": ["builder"],
+      "approvers": ["human-reviewer"],
+      "standing_exceptions": [],
+      "protected_policy": false
+    }
+  },
+  "branch_grants": []
+}

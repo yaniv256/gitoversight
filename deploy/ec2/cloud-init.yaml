@@ -1,0 +1,34 @@
+#cloud-config
+package_update: true
+packages:
+  - awscli
+  - caddy
+  - sqlite3
+  - jq
+
+write_files:
+  - path: /etc/gitoversight/install.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      ARTIFACT_URL=REPLACE_WITH_IMMUTABLE_ARTIFACT_URL
+      ARTIFACT_SHA256=REPLACE_WITH_SHA256
+      GITOVERSIGHT_EDGE=caddy
+      GITOVERSIGHT_DOMAIN=gitoversight.com
+      ACME_EMAIL=REPLACE_WITH_EMAIL
+      GITHUB_APP_CLIENT_SECRET_PARAMETER=REPLACE_WITH_SSM_PARAMETER
+      GITHUB_APP_PRIVATE_KEY_PARAMETER=REPLACE_WITH_SSM_PARAMETER
+      WEBHOOK_SECRET_PARAMETER=REPLACE_WITH_SSM_PARAMETER
+      VAULT_KEY_PARAMETER=REPLACE_WITH_SSM_PARAMETER
+      CHECKPOINT_KEY_PARAMETER=REPLACE_WITH_SSM_PARAMETER
+      NOTIFICATION_TOKEN_PARAMETER=
+
+runcmd:
+  - [bash, -ceu, 'source /etc/gitoversight/install.env; install -d -m 0700 /var/tmp/gitoversight-install; curl --fail --location --proto "=https" --tlsv1.2 "$ARTIFACT_URL" -o /var/tmp/gitoversight-install/release.tar.gz; echo "$ARTIFACT_SHA256  /var/tmp/gitoversight-install/release.tar.gz" | sha256sum -c -; tar -C /var/tmp/gitoversight-install -xzf /var/tmp/gitoversight-install/release.tar.gz; /var/tmp/gitoversight-install/deploy/ec2/install.sh']
+  - [bash, -ceu, 'source /etc/gitoversight/install.env; get_secret() { aws ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text; }; install -d -m 0700 /etc/gitoversight-secrets/github-app /etc/gitoversight-secrets/notifications; get_secret "$GITHUB_APP_CLIENT_SECRET_PARAMETER" > /etc/gitoversight-secrets/github-app/github-app-client.secret; get_secret "$GITHUB_APP_PRIVATE_KEY_PARAMETER" > /etc/gitoversight-secrets/github-app/github-app.pem; get_secret "$WEBHOOK_SECRET_PARAMETER" > /etc/gitoversight-secrets/github-app/webhook.secret; get_secret "$VAULT_KEY_PARAMETER" > /etc/gitoversight-secrets/vault.key; get_secret "$CHECKPOINT_KEY_PARAMETER" > /etc/gitoversight-secrets/checkpoint.key; if [ -n "$NOTIFICATION_TOKEN_PARAMETER" ]; then get_secret "$NOTIFICATION_TOKEN_PARAMETER" > /etc/gitoversight-secrets/notifications/token; fi; chmod 0600 /etc/gitoversight-secrets/github-app/* /etc/gitoversight-secrets/vault.key /etc/gitoversight-secrets/checkpoint.key; test ! -e /etc/gitoversight-secrets/notifications/token || chmod 0600 /etc/gitoversight-secrets/notifications/token']
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, gitoversight-checkpoint.service]
+  - [systemctl, enable, --now, gitoversight-worker.service]
+  - [systemctl, enable, --now, gitoversight-api.service]
+  - [systemctl, enable, --now, caddy.service]
+  - [bash, -ceu, 'for attempt in $(seq 1 60); do curl --fail --silent http://127.0.0.1:17445/readyz && exit 0; sleep 2; done; echo "Git Oversight broker did not become ready" >&2; exit 1']

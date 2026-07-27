@@ -1,0 +1,11 @@
+{
+  "authority_socket": "/run/gitoversight-notifications/notifications.sock",
+  "worker_id": "ec2-notify-1",
+  "poll_interval": "5s",
+  "lease_duration": "1m",
+  "retry_delay": "10s",
+  "max_attempts": 5,
+  "hive_endpoint": "https://REPLACE_WITH_OPTIONAL_PROVIDER_ENDPOINT/v1/messages",
+  "hive_token_file": "/run/credentials/gitoversight-notify.service/notification-token",
+  "request_timeout": "10s"
+}

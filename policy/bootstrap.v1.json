@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "generation": 1,
+  "repositories": [
+    {"name":"example-org/product.dev","visibility":"private","owners":["agent-one"],"authorized_writers":["agent-one"],"human_approvers":["owner"],"standing_exceptions":[]},
+    {"name":"example-org/product.authorization","visibility":"private","owners":["owner"],"authorized_writers":[],"human_approvers":["owner"],"standing_exceptions":[],"protected_policy":true},
+    {"name":"example-org/product.authorization.dev","visibility":"private","owners":["agent-one"],"authorized_writers":["agent-one"],"human_approvers":["owner"],"standing_exceptions":[]},
+    {"name":"example-org/product.test-public","visibility":"public","owners":["agent-one"],"authorized_writers":["agent-one"],"human_approvers":["owner"],"standing_exceptions":[]},
+    {"name":"example-org/product.test-public.dev","visibility":"private","owners":["agent-one"],"authorized_writers":["agent-one","agent-two"],"human_approvers":["owner"],"standing_exceptions":[]},
+    {"name":"example-org/product.test-private","visibility":"private","owners":["agent-one"],"authorized_writers":["agent-one","agent-two"],"human_approvers":["owner"],"standing_exceptions":[]},
+    {"name":"example-org/shared-library","visibility":"public","owners":["agent-one"],"authorized_writers":["agent-one","agent-three"],"human_approvers":["owner"],"standing_exceptions":["branch.push","pull_request.create","pull_request.update","pull_request.review","pull_request.reply","pull_request.merge"]}
+  ]
+}

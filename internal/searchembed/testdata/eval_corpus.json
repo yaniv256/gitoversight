@@ -1,0 +1,169 @@
+{
+  "docs": [
+    {
+      "name": "acme/agent-kanban",
+      "description": "Kanban board for tracking autonomous agent tasks",
+      "readme": "A kanban board where autonomous agents pull task cards across lists. Each agent claims a task card, moves it to in progress, and drops it in done. Built for multi agent task tracking and backlog grooming on one shared board."
+    },
+    {
+      "name": "acme/actions-json",
+      "description": "Voice assistant control of any website through a browser extension",
+      "readme": "Maps site controls into an actions manifest so a voice assistant can operate any website. The browser extension exposes clicks, forms, and navigation to the assistant, giving voice control of arbitrary pages without site cooperation."
+    },
+    {
+      "name": "acme/gitoversight",
+      "description": "Governance broker holding github writes behind human approval",
+      "readme": "Every github write flows through the broker. Public pushes need explicit human approval; private branches stay open. Approval gates, audit trails, and brokered credentials for agent mediated github writes."
+    },
+    {
+      "name": "acme/babel3",
+      "description": "Realtime voice pipeline with speaker diarization and text to speech",
+      "readme": "Streams microphone audio through transcription, runs speaker diarization to tell voices apart, and speaks replies with neural text to speech. Speaker embeddings enroll each participant into the diarization model, keeping the audio pipeline realtime."
+    },
+    {
+      "name": "acme/searchstore",
+      "description": "Sqlite cache of repo metadata with full text search and quantized vectors",
+      "readme": "A rebuildable sqlite database holding repo rows, an fts5 full text index, and int8 quantized embedding vectors for semantic ranking. Everything inside is derived and safe to rebuild."
+    },
+    {
+      "name": "acme/chrome-launcher",
+      "description": "Launches chrome with a remote debugging port",
+      "readme": "Finds the chrome binary, prepares a clean profile, and launches chrome with the remote debugging port open so automation can attach over the devtools protocol."
+    },
+    {
+      "name": "acme/hyperframes",
+      "description": "Render video from html and css compositions",
+      "readme": "Author scenes as html and css, then render deterministic video frames with a headless engine. Timeline seeking, transitions, and encoding produce the final video file."
+    },
+    {
+      "name": "acme/trello-sync",
+      "description": "Syncs trello cards with local task files",
+      "readme": "Two way sync between a trello board and markdown task files. Card moves, list changes, and descriptions replicate in both directions."
+    },
+    {
+      "name": "acme/incident-investigation",
+      "description": "Structured root cause analysis methodology for production incidents",
+      "readme": "A ten phase methodology for hypothesis driven debugging: preserve evidence, run experiments, assign blame, and write the postmortem. Root cause analysis with formal anti patterns and remediation planning."
+    },
+    {
+      "name": "acme/codebase-memory",
+      "description": "Knowledge graph over source code for structural queries",
+      "readme": "Indexes a repository into a knowledge graph of functions, calls, and dependencies. Run graph queries for callers, call chains, dead code detection, and impact analysis over the source."
+    },
+    {
+      "name": "acme/markdown-parser",
+      "description": "Fast markdown parser with commonmark compliance",
+      "readme": "Parses markdown into an abstract syntax tree. Commonmark compliant, with extensions for tables and footnotes. The syntax tree can be walked or rendered."
+    },
+    {
+      "name": "acme/lorem-recipes",
+      "description": "Lorem ipsum dolor sit amet cooking recipes",
+      "readme": "Sourdough bread needs flour, water, salt, and patience. Roast chicken shines with rosemary and lemon. Pasta carbonara whisks eggs, pecorino, and guanciale. Simmer the ragu slowly. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor."
+    },
+    {
+      "name": "acme/weather-cli",
+      "description": "Terminal weather forecasts",
+      "readme": "Prints hourly and weekly forecasts in the terminal with wind, humidity, and precipitation columns."
+    },
+    {
+      "name": "acme/json-schema-validator",
+      "description": "Validates json documents against json schema drafts",
+      "readme": "Draft 2020-12 validator with detailed error paths and format assertions."
+    },
+    {
+      "name": "acme/oauth2-proxy",
+      "description": "Reverse proxy enforcing oauth2 login",
+      "readme": "Sits in front of upstream services and requires an oauth2 identity before forwarding requests. Supports cookie sessions and header injection."
+    },
+    {
+      "name": "acme/websocket-relay",
+      "description": "Relays websocket streams between processes",
+      "readme": "A relay hub that fans websocket frames out to subscribers with backpressure and reconnect handling."
+    },
+    {
+      "name": "acme/image-resizer",
+      "description": "Batch image resizing service",
+      "readme": "Resizes and crops images on upload, producing thumbnail and preview variants with caching."
+    },
+    {
+      "name": "acme/log-shipper",
+      "description": "Ships structured logs to remote sinks",
+      "readme": "Tails log files, batches records, and ships them to remote sinks with retry and disk buffering."
+    },
+    {
+      "name": "acme/cron-scheduler",
+      "description": "Distributed cron style job scheduler",
+      "readme": "Schedules jobs with cron expressions, leader election, and missed run catch up."
+    },
+    {
+      "name": "acme/dns-resolver",
+      "description": "Caching dns resolver library",
+      "readme": "Resolves hostnames with caching, negative caching, and configurable upstream servers."
+    },
+    {
+      "name": "acme/ssh-tunnel",
+      "description": "Manages persistent ssh tunnels",
+      "readme": "Keeps ssh port forwards alive across network drops with health checks and automatic restarts."
+    },
+    {
+      "name": "acme/rate-limiter",
+      "description": "Token bucket rate limiting middleware",
+      "readme": "Per client token bucket limits with burst allowances and shared counters."
+    },
+    {
+      "name": "acme/pdf-extractor",
+      "description": "Extracts text and tables from pdf files",
+      "readme": "Pulls text runs and table cells out of pdf documents, preserving reading order."
+    },
+    {
+      "name": "acme/email-templates",
+      "description": "Transactional email template engine",
+      "readme": "Composes transactional email with layouts, partials, and inline styling."
+    },
+    {
+      "name": "acme/csv-differ",
+      "description": "Diffs large csv files by key",
+      "readme": "Streams two csv files and reports added, removed, and changed rows keyed by chosen columns."
+    },
+    {
+      "name": "acme/redis-queue",
+      "description": "Reliable job queue on redis",
+      "readme": "At least once delivery job queue with visibility timeouts, dead letter lists, and consumer groups on redis."
+    },
+    {
+      "name": "acme/terraform-modules",
+      "description": "Reusable terraform infrastructure modules",
+      "readme": "Opinionated terraform modules for networks, clusters, and storage buckets with sane defaults."
+    },
+    {
+      "name": "acme/unit-converter",
+      "description": "Converts between measurement units",
+      "readme": "Length, mass, temperature, and currency conversions with locale aware formatting."
+    },
+    {
+      "name": "acme/spell-checker",
+      "description": "Spelling correction library with suggestions",
+      "readme": "Detects misspelled words and offers ranked suggestions using edit distance and frequency lists."
+    },
+    {
+      "name": "acme/geo-fence",
+      "description": "Geofencing alerts for moving assets",
+      "readme": "Watches asset positions and raises alerts when they enter or leave polygon fences."
+    }
+  ],
+  "queries": [
+    { "query": "kanban board agent tasks", "target": "acme/agent-kanban" },
+    { "query": "voice assistant browser control", "target": "acme/actions-json", "semantic": true },
+    { "query": "human approval gates github writes", "target": "acme/gitoversight", "semantic": true },
+    { "query": "speaker diarization audio pipeline", "target": "acme/babel3", "semantic": true },
+    { "query": "quantized vectors full text search", "target": "acme/searchstore" },
+    { "query": "commonmark abstract syntax tree", "target": "acme/markdown-parser", "semantic": true },
+    { "query": "launch chrome remote debugging", "target": "acme/chrome-launcher" },
+    { "query": "render video html css", "target": "acme/hyperframes", "semantic": true },
+    { "query": "sync trello cards board", "target": "acme/trello-sync" },
+    { "query": "root cause analysis postmortem", "target": "acme/incident-investigation", "semantic": true },
+    { "query": "knowledge graph source code queries", "target": "acme/codebase-memory", "semantic": true },
+    { "query": "markdown parser", "target": "acme/markdown-parser" }
+  ],
+  "distractor": "acme/lorem-recipes"
+}

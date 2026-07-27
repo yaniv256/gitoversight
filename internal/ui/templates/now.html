@@ -1,0 +1,29 @@
+{{define "content"}}
+<h1 class="large">Now</h1>
+{{if .Item.ItemID}}
+<div class="card">
+  <span class="chip">{{.Item.Kind}}</span>
+  <p style="font-size:19px;font-weight:650;margin:10px 0 4px">{{.Item.Ref}}</p>
+  <p class="muted" style="margin:0 0 14px">{{.Depth}} in your queue · this is 1 of {{.Depth}}</p>
+  {{if eq .Item.Kind "sync"}}<a class="btn" href="/ui/sync/{{.Item.Ref}}">Open</a>{{else if eq .Item.Kind "approval"}}<a class="btn" href="/ui/approval/{{.Item.Ref}}">Open</a>{{else}}<span class="chip">{{.Item.Kind}}</span>{{end}}
+  <div class="actions" style="flex-direction:row;margin-top:10px">
+    <button class="btn secondary" style="font-size:14px;padding:9px 0" data-action="defer" data-url="/v1/human/queue/{{.Item.ItemID}}/defer" data-body='{"mode":"skip"}'>Skip</button>
+    <button class="btn secondary" style="font-size:14px;padding:9px 0" data-action="defer" data-url="/v1/human/queue/{{.Item.ItemID}}/defer" data-body='{"mode":"later"}'>Later</button>
+    <button class="btn secondary" style="font-size:14px;padding:9px 0" data-action="defer" data-url="/v1/human/queue/{{.Item.ItemID}}/defer" data-body='{"mode":"shelve"}'>Shelve</button>
+  </div>
+  <div id="banner" class="banner"></div>
+</div>
+{{else if .PendingPromotion}}
+<div class="card">
+  <span class="chip">policy</span>
+  <p style="font-size:19px;font-weight:650;margin:10px 0 4px">A policy update is staged for your review</p>
+  <p class="muted" style="margin:0 0 14px">Hash-bound to the exact staged version — refused safely if anything drifted.</p>
+  <a class="btn" href="/ui/promote-policy">Review &amp; promote</a>
+</div>
+{{else}}
+<div class="empty">
+  <div class="big">Nothing needs you.</div>
+  <div>When something does, it appears here — one at a time.</div>
+</div>
+{{end}}
+{{end}}

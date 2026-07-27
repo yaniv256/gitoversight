@@ -1,0 +1,39 @@
+{{define "content"}}
+<h1 class="large">Search</h1>
+<form class="card" action="/ui/search" method="get">
+  <input class="search-input" type="search" name="q" value="{{.Query}}" placeholder="Repositories, descriptions, READMEs" autocomplete="off"
+         style="width:100%;box-sizing:border-box;font-size:17px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:transparent;color:inherit;margin-bottom:10px">
+  <button class="btn" type="submit">Search</button>
+</form>
+{{if .NotConfigured}}
+<div class="card">
+  <p class="muted" style="margin:0">The search dataset is not configured — set <code>search_db_path</code> in the worker and API configuration to enable it.</p>
+</div>
+{{else if .IndexBuilding}}
+<div class="card">
+  <p class="muted" style="margin:0">The search index is still building — it fills in after the first dataset sync. Try again in a bit.</p>
+</div>
+{{else if .SearchError}}
+<div class="card">
+  <p class="muted" style="margin:0"><span class="chip deny">unavailable</span> Search is unavailable right now. It is safe to retry.</p>
+</div>
+{{else if not .Query}}
+<div class="empty">
+  <div class="big">Search your repositories.</div>
+  <div>Names, descriptions, and READMEs — from the synced dataset.</div>
+</div>
+{{else if not .Results}}
+<div class="empty">
+  <div class="big">No matches.</div>
+  <div>Try different words, or refresh the dataset from Everything.</div>
+</div>
+{{else}}
+{{range .Results}}
+<div class="card">
+  <p style="font-weight:700;margin:0"><a href="{{.HTMLURL}}">{{.Name}} ↗</a></p>
+  {{if .Description}}<p class="muted" style="margin:6px 0 0">{{.Description}}</p>{{end}}
+  {{if .Snippet}}<p class="faint" style="margin:6px 0 0;font-size:13px">{{.Snippet}}</p>{{end}}
+</div>
+{{end}}
+{{end}}
+{{end}}

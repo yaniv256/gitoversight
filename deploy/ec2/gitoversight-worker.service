@@ -1,0 +1,50 @@
+[Unit]
+Description=Git Oversight privileged mutation worker
+After=network-online.target
+Wants=network-online.target
+Before=gitoversight-api.service
+
+[Service]
+Type=simple
+User=gitoversight-worker
+Group=gitoversight-worker
+SupplementaryGroups=gitoversight-authority
+RuntimeDirectory=gitoversight-worker
+RuntimeDirectoryMode=0750
+StateDirectory=gitoversight-worker
+StateDirectoryMode=0700
+ExecStart=/usr/local/libexec/gitoversight-worker -config /etc/gitoversight/worker.json
+LoadCredential=github-app-client-secret:/etc/gitoversight-secrets/github-app/github-app-client.secret
+LoadCredential=github-app-private-key:/etc/gitoversight-secrets/github-app/github-app.pem
+LoadCredential=vault-key:/etc/gitoversight-secrets/vault.key
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/run/gitoversight-worker /run/gitoversight-authority /var/lib/gitoversight-worker
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

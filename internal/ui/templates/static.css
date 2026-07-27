@@ -1,0 +1,140 @@
+  :root {
+    --bg:#f5f4f0; --card:#ffffff; --ink:#1c1c1e; --soft:#6e6e73; --faint:#aeaeb2;
+    --line:rgba(60,60,67,.12); --accent:#2f6f5b; --accent-soft:rgba(47,111,91,.12);
+    --deny:#b3543a; --tabbar:rgba(249,249,251,.92);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0e0e10; --card:#1c1c1e; --ink:#f2f2f7; --soft:#98989f; --faint:#636368;
+      --line:rgba(84,84,88,.4); --accent:#4fae8e; --accent-soft:rgba(79,174,142,.16);
+      --deny:#d6795e; --tabbar:rgba(22,22,24,.92);
+    }
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; }
+  body {
+    background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,system-ui,sans-serif;
+    font-size:17px; line-height:1.45; -webkit-font-smoothing:antialiased;
+    /* Reserve for the fixed tabbar so the END of the document clears it. 64px
+       was the bar's own height with nothing to spare: an action row at the fold
+       rendered visibly but was not hit-testable — occluded_by named the tabbar,
+       and the button could not be tapped.
+
+       Observed live while declining an approval (2026-07-26): the button's
+       label grows on the confirm tap ("Tap again to confirm"), which reflows
+       the row downward into the bar. A control that cannot receive events is
+       the same defect class as one that cannot succeed.
+
+       This padding alone is NOT sufficient, which the first fix got wrong: it
+       reserves space at the bottom of the DOCUMENT, while the tabbar occludes
+       by VIEWPORT position. Mid-document the padding is irrelevant and any
+       control landing under the bar is still dead. See .btn's
+       scroll-margin-bottom for the half that covers every scroll position. */
+    padding-bottom:calc(112px + env(safe-area-inset-bottom));
+  }
+  .page { max-width:680px; margin:0 auto; padding:12px 16px 24px; }
+  h1.large { font-size:34px; font-weight:750; letter-spacing:.01em; margin:16px 0 14px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:12px;
+    box-shadow:0 1px 2px rgba(0,0,0,.05); border:1px solid var(--line); }
+  .chip { display:inline-block; font-size:12px; font-weight:650; letter-spacing:.02em;
+    padding:3px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); }
+  .chip.deny { background:rgba(179,84,58,.12); color:var(--deny); }
+  .muted { color:var(--soft); } .faint { color:var(--faint); }
+  a.btn, button.btn {
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+    font:inherit; font-size:16px; font-weight:650; text-decoration:none; cursor:pointer;
+    padding:12px 18px; border-radius:12px; border:none; width:100%;
+    background:var(--accent); color:#fff; transition:opacity .15s ease;
+  }
+  a.btn:active, button.btn:active { opacity:.75; }
+  /* The other half of the tabbar fix. Body padding only clears the bar at the
+     END of the document; the bar is fixed, so it occludes by viewport position
+     and a button anywhere mid-page can sit under it. Caught live on the U5
+     journey (2026-07-26): "Request changes" at scrollY 248 hit-tested as the
+     tabbar's own link, so a reviewer could not have clicked it — while the
+     button beneath the fold at the document end was fine, which is exactly why
+     verifying the first fix at one scroll position proved nothing.
+
+     scroll-margin-bottom makes every scrollIntoView — the browser's own on
+     focus/anchor, and any caller's — stop short of the bar. */
+  a.btn, button.btn { scroll-margin-bottom:calc(124px + env(safe-area-inset-bottom)); }
+  .btn.secondary { background:var(--accent-soft); color:var(--accent); }
+  .empty { text-align:center; padding:56px 20px; color:var(--soft); }
+  .empty .big { font-size:21px; font-weight:650; color:var(--ink); margin-bottom:6px; }
+  nav.tabbar {
+    position:fixed; bottom:0; left:0; right:0; z-index:10;
+    display:flex; backdrop-filter:saturate(1.6) blur(18px); background:var(--tabbar);
+    border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom);
+  }
+  nav.tabbar a {
+    flex:1; text-align:center; padding:9px 0 7px; text-decoration:none;
+    color:var(--faint); font-size:11px; font-weight:600; letter-spacing:.02em;
+  }
+  nav.tabbar a .ic { display:block; font-size:22px; line-height:1.15; }
+  nav.tabbar a.active { color:var(--accent); }
+  @media (prefers-reduced-motion: no-preference) {
+    .card { animation: rise .32s cubic-bezier(.2,.7,.3,1) both; }
+    @keyframes rise { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+  }
+/* --- stage rail (This-one) --- */
+.rail { list-style:none; margin:0 0 16px; padding:0; }
+.rail li { display:flex; align-items:center; gap:12px; padding:10px 0; color:var(--faint); font-size:15px; }
+.rail li .dot { width:10px; height:10px; border-radius:50%; background:var(--line); flex:none; }
+.rail li.done { color:var(--soft); } .rail li.done .dot { background:var(--accent); opacity:.5; }
+.rail li.current { color:var(--ink); font-weight:650; } .rail li.current .dot { background:var(--accent); box-shadow:0 0 0 4px var(--accent-soft); }
+.banner { border-radius:12px; padding:12px 14px; font-size:14.5px; margin-bottom:12px; display:none; }
+.banner.error { display:block; background:rgba(179,84,58,.12); color:var(--deny); }
+.banner.ok { display:block; background:var(--accent-soft); color:var(--accent); }
+/* The pending-confirmation question. It carries the full sentence so the button
+   can stay short — a button whose label is a paragraph is unreadable on a
+   phone and buries its own instruction. */
+.banner.warn { display:block; background:rgba(179,138,58,.14); font-weight:600; }
+/* A recovery link inside a banner. The expired-session banner no longer
+   auto-navigates, so the way forward has to be tappable and obvious. */
+.banner-action { display:inline-block; margin-top:8px; padding:8px 12px; border-radius:8px;
+  background:var(--deny); color:#fff; text-decoration:none; font-weight:600; font-size:14px; }
+.proposal { white-space:pre-wrap; font-size:15.5px; background:var(--bg); border-radius:10px; padding:12px; margin:10px 0; }
+.files { margin:0 0 4px; padding-left:18px; font-size:14px; color:var(--soft); }
+.actions { display:flex; flex-direction:column; gap:10px; margin-top:14px; }
+
+/* --- pre-PR diff review ---
+   The page is read on a phone, so the ONE hard rule here is that long code
+   lines scroll inside their own block and never push the page sideways. */
+.notice { border-radius:12px; padding:12px 14px; font-size:14.5px; margin:0 0 10px; }
+.notice.warn { background:rgba(179,84,58,.12); color:var(--deny); }
+.notice.deny { background:rgba(179,84,58,.18); color:var(--deny); font-weight:600; }
+.submitter { font-size:14.5px; margin:10px 0 0; }
+.difftotals { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+  font-size:14px; color:var(--soft); margin:14px 0 8px;
+  padding-bottom:10px; border-bottom:1px solid var(--line); }
+.plus { color:var(--accent); font-weight:650; }
+.minus { color:var(--deny); font-weight:650; }
+
+.filediff { border:1px solid var(--line); border-radius:12px; margin:0 0 10px; overflow:hidden; }
+.filediff > summary { list-style:none; cursor:pointer; padding:11px 13px;
+  display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+  background:var(--bg); font-size:14.5px; }
+.filediff > summary::-webkit-details-marker { display:none; }
+.filediff > summary::before { content:"▸"; color:var(--faint); flex:none; }
+.filediff[open] > summary::before { content:"▾"; }
+.fpath { font-weight:600; word-break:break-all; flex:1 1 auto; min-width:0; }
+.fmeta { display:flex; flex-wrap:wrap; align-items:center; gap:6px; flex:none; }
+.diffnote { padding:12px 13px; margin:0; font-size:14px; }
+
+/* The diff body is the only horizontally-scrolling region on the page. */
+.diff { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.hunk, .dl {
+  font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  font-size:13px; line-height:1.5; white-space:pre;
+  padding:1px 13px; margin:0; min-width:max-content;
+}
+.hunk { color:var(--faint); background:var(--bg); padding-top:6px; padding-bottom:6px; }
+.dl.ctx { color:var(--soft); }
+.dl.add { background:var(--accent-soft); color:var(--ink); }
+.dl.del { background:rgba(179,84,58,.12); color:var(--ink); }
+
+.notelabel { display:block; font-size:13.5px; color:var(--soft); margin:12px 0 6px; }
+.note { width:100%; box-sizing:border-box; font:inherit; font-size:15px;
+  color:var(--ink); background:var(--bg); border:1px solid var(--line);
+  border-radius:10px; padding:10px; resize:vertical; }
