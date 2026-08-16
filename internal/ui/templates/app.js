@@ -10,6 +10,25 @@
 (function () {
   var meta = document.querySelector('meta[name="csrf-token"]');
   var csrf = meta ? meta.getAttribute('content') : '';
+  document.addEventListener('toggle', function (event) {
+    var details = event.target;
+    if (!details || details.tagName !== 'DETAILS' || !details.open ||
+        !details.hasAttribute('data-diff-url') || details.getAttribute('data-diff-loaded') === '1') return;
+    // Mark before fetch so close/reopen cannot issue a duplicate request.
+    details.setAttribute('data-diff-loaded', '1');
+    var target = details.querySelector('.lazy-diff');
+    if (!target) return;
+    target.textContent = 'Loading diff…';
+    fetch(details.getAttribute('data-diff-url'), { credentials: 'same-origin' }).then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.text();
+    }).then(function (html) {
+      target.innerHTML = html;
+    }).catch(function (error) {
+      target.textContent = 'Could not load this diff (' + error.message + '). Reload the review before authorizing.';
+      target.className = 'lazy-diff notice deny';
+    });
+  }, true);
   function banner(kind, text) {
     var el = document.getElementById('banner');
     if (!el) return;
@@ -86,29 +105,23 @@
     }).then(function (response) {
       if (response.ok) { window.location.reload(); return; }
       if (response.status === 401 || response.status === 403) {
-        // Publishing requires a RECENT sign-in (a step-up), which lapses long
-        // before the session itself does. So a 403 here usually means "confirm
-        // it's you", not "you are logged out" — and the fix is a round-trip
-        // that comes BACK to this page.
+        // This used to claim "publishing needs a fresh sign-in" and offer a
+        // login link. That was a GUESS — the API answers 403 for several
+        // unrelated reasons and does not say which — and the guess was wrong,
+        // so its remedy could not work. Yaniv signed in repeatedly, returned,
+        // tapped publish, and got the same banner: an infinite loop built out
+        // of a confident, incorrect diagnosis (2026-07-27).
         //
-        // Do NOT auto-redirect. A 1.6s banner before navigating away is a
-        // message nobody reads: the reader lands on the login flow, completes
-        // it, and is left believing the action succeeded. Yaniv confirmed
-        // "publish this to the public repo", saw the page move on, and
-        // reasonably concluded a PR existed — none had been requested
-        // (2026-07-26). The one moment the user MUST understand is the moment
-        // their action did not happen, so it waits for a deliberate tap.
-        banner('error', 'Publishing needs a fresh sign-in to confirm it is you. Nothing was published or changed. Confirm below and you will come straight back here to finish.');
-        var el = document.getElementById('banner');
-        if (el && !document.getElementById('reauth-link')) {
-          var link = document.createElement('a');
-          link.id = 'reauth-link';
-          link.href = '/login/github?return_to=' + encodeURIComponent(window.location.pathname + window.location.search);
-          link.className = 'banner-action';
-          link.textContent = 'Confirm it is me, then return here';
-          el.appendChild(document.createElement('br'));
-          el.appendChild(link);
-        }
+        // The step-up that message described has since been removed entirely;
+        // it was never a requirement. A confident wrong message is worse than
+        // an honest vague one, because it sends the reader to do something
+        // futile instead of asking. So this now says only what is certainly
+        // true: the action did not happen, and nothing changed.
+        //
+        // Do NOT auto-redirect. A banner shown for a moment before navigating
+        // away is a message nobody reads, and the reader is left believing the
+        // action succeeded (2026-07-26).
+        banner('error', 'That did not go through, and nothing was published or changed. Your session may have expired — reload the page. If it happens again, the reason is in the server log; do not keep retrying.');
         button.disabled = false;
         return;
       }

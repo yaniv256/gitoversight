@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/yaniv256/gitoversight.dev/internal/storage"
@@ -59,5 +60,61 @@ func TestBranchPushRejectsTamperedObjectPackageBeforeGrant(t *testing.T) {
 	operation := storage.Operation{ID: "op-1", Repository: "yaniv256/private", Kind: "branch.push", Branch: "feat/a", PayloadJSON: encoded}
 	if err := validateExecutableOperation(operation); !errors.Is(err, ErrDurableInvalid) {
 		t.Fatalf("tampered packet error = %v", err)
+	}
+}
+
+func TestReleaseAssetValidationAcceptsMetadataDescriptorOnly(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"tag_name":     "v1",
+		"name":         "actions-json-mcp-linux-x64.tar.gz",
+		"content_type": "application/gzip",
+		"asset": map[string]any{
+			"stage_id": "0123456789abcdef0123456789abcdef",
+			"sha256":   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"size":     float64(15 << 20),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := storage.Operation{
+		ID: "asset-1", Repository: "yaniv256/private", Kind: "release.asset.upload", PayloadJSON: payload,
+	}
+	if err := validateExecutableOperation(operation); err != nil {
+		t.Fatalf("descriptor packet rejected: %v", err)
+	}
+}
+
+func TestReleaseAssetValidationRejectsNewInlinePayload(t *testing.T) {
+	err := rejectNewInlineReleaseAsset(map[string]any{
+		"tag_name": "v1", "name": "bridge.zip", "content_type": "application/zip",
+		"content_base64": "YWJj", "sha256": "abc", "size": float64(3),
+	})
+	if !errors.Is(err, ErrStreamedAssetRequired) {
+		t.Fatalf("inline error = %v, want ErrStreamedAssetRequired", err)
+	}
+}
+
+func TestReleaseAssetBundleValidationAcceptsExactDescriptorsAndRejectsDuplicates(t *testing.T) {
+	descriptor := func(name, stage, digest string) map[string]any {
+		return map[string]any{
+			"tag_name": "v1", "name": name, "content_type": "application/gzip",
+			"asset": map[string]any{"stage_id": stage, "sha256": digest, "size": float64(42)},
+		}
+	}
+	payload := map[string]any{"assets": []any{
+		descriptor("linux.tar.gz", "0123456789abcdef0123456789abcdef", strings.Repeat("a", 64)),
+		descriptor("mac.tar.gz", "fedcba9876543210fedcba9876543210", strings.Repeat("b", 64)),
+	}}
+	encoded, _ := json.Marshal(payload)
+	operation := storage.Operation{ID: "assets-1", Repository: "yaniv256/private", Kind: "release.assets.upload", PayloadJSON: encoded}
+	if err := validateExecutableOperation(operation); err != nil {
+		t.Fatalf("bundle packet rejected: %v", err)
+	}
+	payload["assets"].([]any)[1].(map[string]any)["name"] = "linux.tar.gz"
+	encoded, _ = json.Marshal(payload)
+	operation.PayloadJSON = encoded
+	if err := validateExecutableOperation(operation); !errors.Is(err, ErrDurableInvalid) {
+		t.Fatalf("duplicate bundle error = %v", err)
 	}
 }

@@ -49,7 +49,7 @@ func LimitConcurrent(maximum int, next http.Handler) http.Handler {
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Cache-Control", "no-store")
-		response.Header().Set("Content-Security-Policy", "default-src 'none'; connect-src 'self'; frame-ancestors 'none'")
+		response.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'")
 		response.Header().Set("Referrer-Policy", "no-referrer")
 		response.Header().Set("X-Content-Type-Options", "nosniff")
 		response.Header().Set("X-Frame-Options", "DENY")

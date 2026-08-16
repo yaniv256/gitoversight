@@ -31,6 +31,15 @@ func lines(count int, prefix string) string {
 	return out.String()
 }
 
+func TestDiffFileRefusesQuadraticWorkBeforeComputingLCS(t *testing.T) {
+	base := lines(6000, "old ")
+	proposed := lines(6000, "new ")
+	diff := prpreview.DiffFile("adversarial.txt", []byte(base), []byte(proposed), prpreview.ChangeModify)
+	if !diff.Truncated || !diff.CountsUnavailable || len(diff.Hunks) != 0 {
+		t.Fatalf("quadratic-work refusal = %+v", diff)
+	}
+}
+
 // The scenario that motivates the whole unit: Yaniv's 500-line file with a
 // 3-line change must render as a small diff, not 500 lines of noise.
 func TestDiffFileShowsOnlyTheChangedLinesOfALargeFile(t *testing.T) {

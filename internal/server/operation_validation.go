@@ -6,11 +6,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/yaniv256/gitoversight.dev/internal/commitpacket"
+	"github.com/yaniv256/gitoversight.dev/internal/releaseasset"
 	"github.com/yaniv256/gitoversight.dev/internal/storage"
 )
+
+var (
+	releaseAssetStageIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	releaseAssetSHA256Pattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+type releaseAssetDescriptor struct {
+	StageID     string
+	SHA256      string
+	Size        int64
+	TagName     string
+	Name        string
+	ContentType string
+}
 
 // validateExecutableOperation rejects packets that cannot be both executed and
 // independently reconciled. It runs before a single-use grant is issued.
@@ -73,13 +89,11 @@ func validateExecutableOperation(operation storage.Operation) error {
 		_, prerelease := payload["prerelease"].(bool)
 		valid = operation.Title != "" && requireString("tag_name") && requireString("target_commitish") && prerelease
 	case "release.asset.upload":
-		name, _ := payload["name"].(string)
-		content, contentOK := payload["content_base64"].(string)
-		wantSHA, _ := payload["sha256"].(string)
-		size, sizeOK := payload["size"].(float64)
-		decoded, decodeErr := base64.StdEncoding.DecodeString(content)
-		digest := fmt.Sprintf("%x", sha256.Sum256(decoded))
-		valid = requireString("tag_name") && name != "" && filepath.Base(name) == name && name != "." && name != ".." && !strings.ContainsAny(name, "/\\\x00") && requireString("content_type") && contentOK && decodeErr == nil && sizeOK && size > 0 && size <= 700<<10 && size == float64(len(decoded)) && len(wantSHA) == 64 && strings.EqualFold(wantSHA, digest)
+		_, descriptorErr := parseReleaseAssetDescriptor(payload)
+		valid = descriptorErr == nil || validLegacyInlineReleaseAsset(payload)
+	case "release.assets.upload":
+		_, descriptorErr := parseReleaseAssetDescriptors(payload)
+		valid = descriptorErr == nil
 	case "repository.create":
 		visibility, _ := payload["visibility"].(string)
 		owner, name, found := strings.Cut(operation.Repository, "/")
@@ -93,6 +107,98 @@ func validateExecutableOperation(operation storage.Operation) error {
 		return fmt.Errorf("%w: %s packet cannot be executed and independently reconciled", ErrDurableInvalid, operation.Kind)
 	}
 	return nil
+}
+
+func parseReleaseAssetDescriptors(payload map[string]any) ([]releaseAssetDescriptor, error) {
+	if len(payload) != 1 {
+		return nil, fmt.Errorf("%w: release asset bundle has unexpected fields", ErrDurableInvalid)
+	}
+	raw, ok := payload["assets"].([]any)
+	if !ok || len(raw) == 0 || len(raw) > 64 {
+		return nil, fmt.Errorf("%w: release asset bundle is incomplete", ErrDurableInvalid)
+	}
+	result := make([]releaseAssetDescriptor, 0, len(raw))
+	names, stages := map[string]struct{}{}, map[string]struct{}{}
+	for _, item := range raw {
+		descriptorPayload, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%w: release asset bundle contains an invalid descriptor", ErrDurableInvalid)
+		}
+		descriptor, err := parseReleaseAssetDescriptor(descriptorPayload)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := names[descriptor.Name]; duplicate {
+			return nil, fmt.Errorf("%w: release asset bundle contains duplicate names", ErrDurableInvalid)
+		}
+		if _, duplicate := stages[descriptor.StageID]; duplicate {
+			return nil, fmt.Errorf("%w: release asset bundle contains duplicate stages", ErrDurableInvalid)
+		}
+		names[descriptor.Name], stages[descriptor.StageID] = struct{}{}, struct{}{}
+		result = append(result, descriptor)
+	}
+	return result, nil
+}
+
+// validLegacyInlineReleaseAsset is execution-only compatibility for packets
+// that were durable before streamed staging existed. Submit rejects this shape
+// before it can create a new operation.
+func validLegacyInlineReleaseAsset(payload map[string]any) bool {
+	name, _ := payload["name"].(string)
+	content, contentOK := payload["content_base64"].(string)
+	wantSHA, _ := payload["sha256"].(string)
+	size, sizeOK := payload["size"].(float64)
+	if !contentOK || len(content) > base64.StdEncoding.EncodedLen(int(releaseasset.MaxBytes)) {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil {
+		return false
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(decoded))
+	tag, tagOK := payload["tag_name"].(string)
+	contentType, typeOK := payload["content_type"].(string)
+	return tagOK && strings.TrimSpace(tag) != "" && name != "" && filepath.Base(name) == name &&
+		name != "." && name != ".." && !strings.ContainsAny(name, "/\\\x00") &&
+		typeOK && strings.TrimSpace(contentType) != "" && sizeOK && size > 0 &&
+		size <= float64(releaseasset.MaxBytes) && size == float64(len(decoded)) &&
+		len(wantSHA) == 64 && strings.EqualFold(wantSHA, digest)
+}
+
+func rejectNewInlineReleaseAsset(payload map[string]any) error {
+	if _, present := payload["content_base64"]; present {
+		return fmt.Errorf("%w: stage the file and submit an asset descriptor", ErrStreamedAssetRequired)
+	}
+	return nil
+}
+
+func parseReleaseAssetDescriptor(payload map[string]any) (releaseAssetDescriptor, error) {
+	if len(payload) != 4 {
+		return releaseAssetDescriptor{}, fmt.Errorf("%w: release asset descriptor has unexpected fields", ErrDurableInvalid)
+	}
+	tagName, tagOK := payload["tag_name"].(string)
+	name, nameOK := payload["name"].(string)
+	contentType, typeOK := payload["content_type"].(string)
+	asset, assetOK := payload["asset"].(map[string]any)
+	if !assetOK || len(asset) != 3 {
+		return releaseAssetDescriptor{}, fmt.Errorf("%w: release asset descriptor is incomplete", ErrDurableInvalid)
+	}
+	stageID, stageOK := asset["stage_id"].(string)
+	digest, digestOK := asset["sha256"].(string)
+	sizeValue, sizeOK := asset["size"].(float64)
+	size := int64(sizeValue)
+	if !tagOK || strings.TrimSpace(tagName) == "" || !nameOK || name == "" ||
+		filepath.Base(name) != name || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") ||
+		!typeOK || strings.TrimSpace(contentType) == "" || !stageOK ||
+		!releaseAssetStageIDPattern.MatchString(stageID) || !digestOK ||
+		!releaseAssetSHA256Pattern.MatchString(digest) || !sizeOK || sizeValue < 0 ||
+		sizeValue != float64(size) {
+		return releaseAssetDescriptor{}, fmt.Errorf("%w: release asset descriptor is invalid", ErrDurableInvalid)
+	}
+	return releaseAssetDescriptor{
+		StageID: stageID, SHA256: digest, Size: size, TagName: tagName,
+		Name: name, ContentType: contentType,
+	}, nil
 }
 
 func validRepositorySettings(value any) bool {

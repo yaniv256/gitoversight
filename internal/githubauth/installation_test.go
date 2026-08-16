@@ -66,6 +66,72 @@ func TestInstallationMinterUsesRS256AndExactRepositoryOperationScope(t *testing.
 	}
 }
 
+// TestBranchPushRequestsWorkflowsScope pins the one permission that cannot be
+// inferred from the operation's name.
+//
+// The access_tokens endpoint treats the permissions map as a DOWN-SCOPE: the
+// minted token holds ONLY what is listed, even when the installation was granted
+// more. So a `workflows: write` grant on GitHub is necessary but NOT sufficient —
+// until branch.push named the scope here, a push carrying .github/workflows/
+// still drew `403 Resource not accessible by integration` at POST /git/trees,
+// byte-identical to the ungranted case. Two gates, one error message; the grant
+// was accepted on three installations before this line was found (2026-07-27).
+//
+// It is asserted on branch.push ALONE. branch.push is the only operation whose
+// payload can carry a workflow file, and a scope granted where it cannot be used
+// is authority with no caller.
+func TestBranchPushRequestsWorkflowsScope(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: mustPKCS8(t, key)})
+
+	for _, testCase := range []struct {
+		operation string
+		want      map[string]string
+	}{
+		{"branch.push", map[string]string{"contents": "write", "workflows": "write"}},
+		// Every other contents:write operation must NOT carry it — none of them
+		// can write a workflow file, so requesting it would widen the token for
+		// no reason.
+		{"branch.delete", map[string]string{"contents": "write"}},
+		{"release.publish", map[string]string{"contents": "write"}},
+		{"policy.promote", map[string]string{"contents": "write"}},
+		{"release.asset.upload", map[string]string{"contents": "write"}},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			var body struct {
+				Permissions map[string]string `json:"permissions"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Permissions) != len(testCase.want) {
+				t.Fatalf("%s requested %#v, want exactly %#v", testCase.operation, body.Permissions, testCase.want)
+			}
+			for name, level := range testCase.want {
+				if body.Permissions[name] != level {
+					t.Fatalf("%s requested %s=%q, want %q — a token is down-scoped to what it asks for, so an unlisted permission is unusable however the installation was granted", testCase.operation, name, body.Permissions[name], level)
+				}
+			}
+			io.WriteString(response, `{"token":"ghs_short_lived","expires_at":"2030-01-01T01:00:00Z"}`)
+		}))
+		httpClient := server.Client()
+		httpClient.Timeout = time.Second
+		minter, err := githubauth.NewInstallationMinter(server.URL, "Iv1.client", pemKey, httpClient, map[string]int64{"yaniv256/private": 42})
+		if err != nil {
+			server.Close()
+			t.Fatal(err)
+		}
+		if _, err := minter.Token("yaniv256/private\x00" + testCase.operation); err != nil {
+			server.Close()
+			t.Fatalf("%s: %v", testCase.operation, err)
+		}
+		server.Close()
+	}
+}
+
 func TestInstallationMinterRejectsUnregisteredOrUnsupportedScopeBeforeNetwork(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	pemKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})

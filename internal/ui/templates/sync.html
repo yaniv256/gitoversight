@@ -47,8 +47,6 @@
   {{if not .View.Unavailable}}
   <div class="difftotals">
     <strong>{{len .View.Files}}</strong> file{{if ne (len .View.Files) 1}}s{{end}} changed
-    <span class="plus">+{{.View.TotalAdded}}</span>
-    <span class="minus">&minus;{{.View.TotalRemoved}}</span>
     {{if .View.AddedFiles}}<span class="chip">{{.View.AddedFiles}} added</span>{{end}}
     {{if .View.ModifiedFiles}}<span class="chip">{{.View.ModifiedFiles}} modified</span>{{end}}
     {{if .View.DeletedFiles}}<span class="chip deny">{{.View.DeletedFiles}} deleted</span>{{end}}
@@ -56,30 +54,15 @@
   </div>
 
   {{range .View.Files}}
-  <details class="filediff" {{if $.View.AutoExpand}}open{{end}} id="f-{{.Path}}">
+  <details class="filediff" data-diff-url="/ui/sync/{{$.Sync.ID}}/diff?path={{urlquery .Path}}" id="f-{{.Path}}">
     <summary>
       <span class="fpath">{{.Path}}</span>
       <span class="fmeta">
         {{if .Sensitive}}<span class="chip deny">sensitive</span>{{end}}
         <span class="chip">{{kindLabel .Kind}}</span>
-        {{if .Added}}<span class="plus">+{{.Added}}</span>{{end}}
-        {{if .Removed}}<span class="minus">&minus;{{.Removed}}</span>{{end}}
       </span>
     </summary>
-    {{if .Binary}}
-    <p class="muted diffnote">Binary file — not shown as text.</p>
-    {{else if eq (printf "%s" .Kind) "submodule"}}
-    <p class="muted diffnote">Submodule pointer moves from <code>{{.OldSHA}}</code> to <code>{{.NewSHA}}</code>.</p>
-    {{else if .Truncated}}
-    <p class="muted diffnote">This diff is too large to display ({{.Added}} added, {{.Removed}} removed). The file is still part of this change and was scanned for private identifiers.</p>
-    {{else}}
-    {{range .Hunks}}
-    <div class="diff">
-      <div class="hunk">{{.Header}}</div>
-      {{range .Lines}}<div class="dl {{lineClass .Op}}">{{printf "%c" .Op}}{{.Text}}</div>{{end}}
-    </div>
-    {{end}}
-    {{end}}
+    <div class="lazy-diff" aria-live="polite"><p class="muted diffnote">Open to load this file’s diff.</p></div>
   </details>
   {{end}}
   {{end}}

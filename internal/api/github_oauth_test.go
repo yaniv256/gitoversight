@@ -115,7 +115,7 @@ func TestGitHubOAuthLoginEstablishesRotatedHumanSession(t *testing.T) {
 	if sessionCookie == nil || !sessionCookie.Secure || !sessionCookie.HttpOnly || csrfCookie == nil || !csrfCookie.Secure || csrfCookie.HttpOnly {
 		t.Fatalf("unsafe or missing login cookies: session=%+v csrf=%+v", sessionCookie, csrfCookie)
 	}
-	if _, err := manager.Authorize(context.Background(), sessionCookie.Value, csrfCookie.Value, true); err != nil {
+	if _, err := manager.Authorize(context.Background(), sessionCookie.Value, csrfCookie.Value); err != nil {
 		t.Fatalf("callback did not establish an authenticated session: %v", err)
 	}
 }

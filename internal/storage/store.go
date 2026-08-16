@@ -7,8 +7,10 @@ import (
 )
 
 var (
-	ErrDuplicateNonce   = errors.New("request nonce already consumed")
-	ErrDuplicateWebhook = errors.New("webhook delivery already consumed")
+	ErrDuplicateNonce      = errors.New("request nonce already consumed")
+	ErrDuplicateWebhook    = errors.New("webhook delivery already consumed")
+	ErrStagedAssetNotFound = errors.New("staged asset not found")
+	ErrStagedAssetState    = errors.New("staged asset state transition rejected")
 )
 
 type Store interface {
@@ -25,6 +27,12 @@ type Transaction interface {
 	ConsumeNonce(context.Context, string, string, string, time.Time) error
 	AppendAudit(context.Context, AuditEvent) error
 	AppendOutbox(context.Context, OutboxEvent) error
+	PutStagedAsset(context.Context, StagedAsset) error
+	BeginStagedAssetUpload(context.Context, string, string, string, time.Time) error
+	MarkStagedAssetReady(context.Context, string, string, string, time.Time) error
+	PinStagedAsset(context.Context, StagedAsset, string, time.Time) error
+	AbandonStagedAsset(context.Context, string, string, time.Time) error
+	ExpireStagedAsset(context.Context, string, string, time.Time) error
 }
 
 type Readiness struct {

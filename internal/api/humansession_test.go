@@ -25,10 +25,10 @@ func TestHumanSessionRotatesAtAuthenticationAndUsesSecureCookie(t *testing.T) {
 	if authenticated.Token == pending.Token || authenticated.CSRF == pending.CSRF {
 		t.Fatal("authentication did not rotate session and CSRF tokens")
 	}
-	if _, err := manager.Authorize(context.Background(), pending.Token, pending.CSRF, true); err == nil {
+	if _, err := manager.Authorize(context.Background(), pending.Token, pending.CSRF); err == nil {
 		t.Fatal("fixated pre-authentication session remained valid")
 	}
-	approver, err := manager.Authorize(context.Background(), authenticated.Token, authenticated.CSRF, true)
+	approver, err := manager.Authorize(context.Background(), authenticated.Token, authenticated.CSRF)
 	if err != nil || approver.TenantID != "tenant-a" || approver.ID != "yaniv" || approver.SessionID == "" {
 		t.Fatalf("authorized approver = %+v, %v", approver, err)
 	}
@@ -37,7 +37,7 @@ func TestHumanSessionRotatesAtAuthenticationAndUsesSecureCookie(t *testing.T) {
 		t.Fatalf("unsafe session cookie: %+v", cookie)
 	}
 	csrfCookie := manager.CSRFCookie(authenticated.CSRF)
-	if !csrfCookie.Secure || csrfCookie.HttpOnly || csrfCookie.SameSite != http.SameSiteStrictMode || csrfCookie.Path != "/" {
+	if !csrfCookie.Secure || csrfCookie.HttpOnly || csrfCookie.Path != "/" {
 		t.Fatalf("unsafe CSRF cookie: %+v", csrfCookie)
 	}
 }
@@ -53,10 +53,13 @@ func TestHumanSessionRotatesAtAuthenticationAndUsesSecureCookie(t *testing.T) {
 // human could log in at all. Strictness is not the property worth asserting on
 // a cookie that must cross an identity provider; reachability is.
 //
-// The CSRF cookie keeps Strict deliberately. It guards mutations, not page
-// loads, and nothing needs it during the login round trip — so the two cookies
-// differ on purpose, and this test records which is which.
-func TestSessionCookieSurvivesTheLoginRoundTripAndCSRFStaysStrict(t *testing.T) {
+// This test originally asserted the CSRF cookie stays Strict, on the reasoning
+// that it guards mutations and is not needed during login. That reasoning was
+// WRONG and the assertion pinned a second loop: the UI READS that cookie at
+// render time to populate the page's csrf-token meta tag, so withholding it on
+// the OAuth return produced a page with an empty token whose every POST 403s.
+// TestBothCookiesSurviveTheLoginRoundTrip now covers both.
+func TestSessionCookieSurvivesTheLoginRoundTrip(t *testing.T) {
 	now := time.Unix(1000, 0).UTC()
 	manager := humanSessionManager(t, func() time.Time { return now })
 
@@ -71,9 +74,29 @@ func TestSessionCookieSurvivesTheLoginRoundTripAndCSRFStaysStrict(t *testing.T) 
 		t.Fatalf("session cookie lost Secure/HttpOnly while fixing SameSite: %+v", session)
 	}
 
-	csrf := manager.CSRFCookie("csrf")
-	if csrf.SameSite != http.SameSiteStrictMode {
-		t.Fatalf("CSRF cookie SameSite = %v, want Strict — it guards mutations and is not needed during login", csrf.SameSite)
+}
+
+func TestProtectPagePreservesDirectReviewDestinationWhenLoginIsRequired(t *testing.T) {
+	manager := humanSessionManager(t, time.Now)
+	next := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		t.Fatal("unauthenticated request reached protected page")
+	})
+
+	for _, test := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"sync review", "/ui/sync/review-123?section=files", "/login/github?return_to=%2Fui%2Fsync%2Freview-123%3Fsection%3Dfiles"},
+		{"queue", "/ui/now", "/login/github?return_to=%2Fui%2Fnow"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			manager.ProtectPage(next).ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.path, nil))
+			if response.Code != http.StatusFound || response.Header().Get("Location") != test.want {
+				t.Fatalf("status=%d location=%q want=%q", response.Code, response.Header().Get("Location"), test.want)
+			}
+		})
 	}
 }
 
@@ -87,7 +110,7 @@ func TestHumanSessionMiddlewareDerivesApproverFromServerState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	protected := manager.Protect(true, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+	protected := manager.Protect(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		approver, ok := HumanApproverFromContext(request.Context())
 		if !ok || approver.ID != "yaniv" {
 			t.Fatalf("missing derived approver: %+v", approver)
@@ -115,31 +138,31 @@ func TestHumanSessionRejectsStaleCSRFAndRecentAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Authorize(context.Background(), session.Token, "wrong-csrf", true); err == nil {
+	if _, err := manager.Authorize(context.Background(), session.Token, "wrong-csrf"); err == nil {
 		t.Fatal("wrong CSRF token authorized sensitive action")
 	}
+	// The recent-auth step-up is GONE (see Authorize). It was never requested,
+	// bought no property the session and packet binding did not already
+	// provide, and made publication impossible for a whole evening. A session
+	// that is valid stays valid until it expires.
 	now = now.Add(6 * time.Minute)
-	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF, true); err == nil {
-		t.Fatal("stale recent authentication authorized sensitive action")
+	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF); err != nil {
+		t.Fatalf("a valid session must keep working: the publish-time step-up was invented and is removed: %v", err)
 	}
-	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF, false); err != nil {
+	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF); err != nil {
 		t.Fatalf("ordinary session expired too early: %v", err)
 	}
 }
 
-// The twin of TestHumanSessionRejectsStaleCSRFAndRecentAuthentication above.
-// That test proves the step-up gate CLOSES; it passed all day while the product
-// was unusable, because closing is only half a gate. This one proves the gate
-// can be REOPENED — that a lapsed step-up is recoverable rather than terminal.
+// This test used to prove the invented publish-time step-up could be REOPENED
+// after it lapsed. The step-up itself is now gone — it was never requested, and
+// its only measured effect was making publication impossible while presenting
+// every other failure as "you need a fresh sign-in".
 //
-// Without it, a 10-minute window silently became a permanent deadlock: signed
-// in, Authorize enabled, every tap 403 forever, because login was the only
-// writer of recent_auth_until and nothing routed the human back to it
-// (2026-07-26 — Yaniv could not publish at all).
-//
-// Whenever a gate's closing is asserted, assert its reopening in the same
-// breath, and check the exit has a CALLER — not merely an implementation.
-func TestHumanSessionRecentAuthenticationIsRecoverableAfterItLapses(t *testing.T) {
+// What remains worth asserting is the property that actually protects a
+// publish: a session is bound to ONE approver and one CSRF token, and stays
+// usable for its whole lifetime without re-proving anything.
+func TestAuthenticatedSessionStaysUsableWithoutReAuthenticating(t *testing.T) {
 	now := time.Unix(1000, 0).UTC()
 	manager := humanSessionManager(t, func() time.Time { return now })
 	pending, err := manager.Begin(context.Background(), "tenant-a")
@@ -150,32 +173,23 @@ func TestHumanSessionRecentAuthenticationIsRecoverableAfterItLapses(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF, true); err != nil {
-		t.Fatalf("fresh step-up should authorize: %v", err)
+	// Well past the old ten-minute step-up window, but inside the session's own
+	// one-hour lifetime — the distinction the removed gate erased. A session
+	// expiring is legitimate; a session refusing to act while still valid is
+	// the defect.
+	for _, elapsed := range []time.Duration{0, 6 * time.Minute, 30 * time.Minute, 59 * time.Minute} {
+		now = time.Unix(1000, 0).UTC().Add(elapsed)
+		approver, err := manager.Authorize(context.Background(), session.Token, session.CSRF)
+		if err != nil {
+			t.Fatalf("after %v the reviewer could not act: %v — a publish-time step-up has been reintroduced", elapsed, err)
+		}
+		if approver.ID != "yaniv" {
+			t.Fatalf("approver = %q, want yaniv", approver.ID)
+		}
 	}
-
-	// Let the step-up lapse while the session itself stays valid — the exact
-	// state Yaniv sat in.
-	now = now.Add(6 * time.Minute)
-	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF, true); err == nil {
-		t.Fatal("lapsed step-up must not authorize")
-	}
-	if _, err := manager.Authorize(context.Background(), session.Token, session.CSRF, false); err != nil {
-		t.Fatalf("ordinary session must remain valid: %v", err)
-	}
-
-	// THE POINT: re-authenticating restores it. If this cannot be done, the
-	// reviewer is stuck forever with no path forward.
-	repeat, err := manager.Begin(context.Background(), "tenant-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	refreshed, err := manager.Authenticate(context.Background(), repeat.Token, "yaniv")
-	if err != nil {
-		t.Fatalf("re-authentication must be possible after a lapsed step-up: %v", err)
-	}
-	if _, err := manager.Authorize(context.Background(), refreshed.Token, refreshed.CSRF, true); err != nil {
-		t.Fatalf("re-authentication did not restore the step-up — the gate has no key: %v", err)
+	// The session is still bound: a wrong CSRF token is still refused.
+	if _, err := manager.Authorize(context.Background(), session.Token, "wrong-csrf"); err == nil {
+		t.Fatal("wrong CSRF token authorized an action")
 	}
 }
 
@@ -195,9 +209,43 @@ func humanSessionManager(t *testing.T, now func() time.Time) *HumanSessionManage
 	}); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewHumanSessionManager(db, HumanSessionConfig{SessionTTL: time.Hour, RecentAuthTTL: 5 * time.Minute, Now: now})
+	manager, err := NewHumanSessionManager(db, HumanSessionConfig{SessionTTL: time.Hour, Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return manager
+}
+
+// Both cookies must survive the OAuth return, not just the session one.
+//
+// The UI reads gitoversight_csrf at render time to populate the page's
+// csrf-token meta tag. Under SameSite=Strict the browser withheld it on the
+// redirect from github.com, so the reviewer arrived with a valid session and an
+// EMPTY csrf token, every POST answered 403, and the client — unable to tell
+// that from a lapsed step-up — sent them back to sign in again. Live
+// 2026-07-27: three cycles, publication impossible.
+//
+// Making only the session cookie Lax is what turned a clean failure into a
+// loop: with both Strict the page redirected to login and failed honestly.
+// They travel together or the login round trip is broken.
+func TestBothCookiesSurviveTheLoginRoundTrip(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	manager := humanSessionManager(t, func() time.Time { return now })
+	for _, c := range []struct {
+		name   string
+		cookie *http.Cookie
+	}{
+		{"session", manager.Cookie("token")},
+		{"csrf", manager.CSRFCookie("csrf")},
+	} {
+		if c.cookie.SameSite == http.SameSiteStrictMode {
+			t.Fatalf("%s cookie is SameSite=Strict: the browser withholds it on the redirect back from GitHub, so the reviewer returns to a page that cannot publish", c.name)
+		}
+		if c.cookie.SameSite != http.SameSiteLaxMode {
+			t.Fatalf("%s cookie SameSite = %v, want Lax", c.name, c.cookie.SameSite)
+		}
+		if !c.cookie.Secure {
+			t.Fatalf("%s cookie lost Secure", c.name)
+		}
+	}
 }

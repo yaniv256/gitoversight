@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gitoversight": {
+      "type": "http",
+      "url": "https://gitoversight.com/mcp",
+      "oauth_resource": "https://gitoversight.com/mcp"
+    }
+  }
+}

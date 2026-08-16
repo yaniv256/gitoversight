@@ -27,6 +27,107 @@ type Preview struct {
 // (nil, false, nil) for a path the base does not have.
 type BaseContent func(path string) ([]byte, bool, error)
 
+// Inspect builds the complete, ordered manifest and security warnings without
+// computing line diffs. In particular, it never needs public base content.
+func Inspect(packet commitpacket.Packet, baseEntries map[string]BaseEntry, privateIdentities []attribution.Identity) (Preview, error) {
+	preview := Preview{BaseCommitSHA: packet.Tree.BaseTree}
+	blobBySHA := make(map[string][]byte, len(packet.Blobs))
+	for _, blob := range packet.Blobs {
+		content, err := base64.StdEncoding.DecodeString(blob.Content)
+		if err != nil {
+			return Preview{}, errors.New("packet blob content is not valid base64")
+		}
+		blobBySHA[blob.SHA] = content
+	}
+	publishedText := make(map[string][]byte)
+	for _, entry := range packet.Tree.Entries {
+		base, existed := baseEntries[entry.Path]
+		var file FileDiff
+		switch {
+		case entry.Delete:
+			file = FileDiff{Path: entry.Path, Kind: ChangeDelete, Sensitive: SensitivePath(entry.Path)}
+		case entry.Type == "commit" || entry.Mode == submoduleTreeMode:
+			file = DiffSubmodule(entry.Path, base.SHA, entry.SHA)
+		default:
+			kind := ChangeAdd
+			if existed {
+				kind = ChangeModify
+			}
+			file = FileDiff{Path: entry.Path, Kind: kind, Sensitive: SensitivePath(entry.Path)}
+			// Missing packet content denotes a mode-only delta. Its bytes are
+			// already public, so there is neither a base read nor a new leak to scan.
+			if proposed, present := blobBySHA[entry.SHA]; present {
+				publishedText[entry.Path] = proposed
+			} else if !existed || entry.SHA != base.SHA {
+				return Preview{}, errors.New("packet omits changed blob content")
+			}
+		}
+		preview.Files = append(preview.Files, file)
+	}
+	sort.Slice(preview.Files, func(i, j int) bool { return preview.Files[i].Path < preview.Files[j].Path })
+	preview.Warnings = buildWarnings(preview.Files, publishedText, packet, privateIdentities)
+	return preview, nil
+}
+
+// BuildFile renders exactly one changed path from an immutable packet.
+func BuildFile(packet commitpacket.Packet, path string, base BaseContent, baseEntries map[string]BaseEntry) (FileDiff, error) {
+	var selected *commitpacket.TreeEntry
+	for i := range packet.Tree.Entries {
+		if packet.Tree.Entries[i].Path == path {
+			if selected != nil {
+				return FileDiff{}, errors.New("packet path is duplicated")
+			}
+			selected = &packet.Tree.Entries[i]
+		}
+	}
+	if selected == nil {
+		return FileDiff{}, errors.New("path is not part of this proposal")
+	}
+	entry := *selected
+	baseEntry, existed := baseEntries[path]
+	if entry.Delete {
+		if entry.Type == "commit" || entry.Mode == submoduleTreeMode {
+			return FileDiff{Path: path, Kind: ChangeDelete, Sensitive: SensitivePath(path)}, nil
+		}
+		prior, _, err := base(path)
+		if err != nil {
+			return FileDiff{}, err
+		}
+		return DiffFile(path, prior, nil, ChangeDelete), nil
+	}
+	if entry.Type == "commit" || entry.Mode == submoduleTreeMode {
+		return DiffSubmodule(path, baseEntry.SHA, entry.SHA), nil
+	}
+	prior, basePresent, err := base(path)
+	if err != nil {
+		return FileDiff{}, err
+	}
+	var proposed []byte
+	carried := false
+	for _, blob := range packet.Blobs {
+		if blob.SHA != entry.SHA {
+			continue
+		}
+		content, err := base64.StdEncoding.DecodeString(blob.Content)
+		if err != nil {
+			return FileDiff{}, errors.New("packet blob content is not valid base64")
+		}
+		proposed, carried = content, true
+		break
+	}
+	if !carried {
+		if !existed || entry.SHA != baseEntry.SHA {
+			return FileDiff{}, errors.New("packet omits changed blob content")
+		}
+		proposed = prior // same-path, same-blob mode-only delta
+	}
+	kind := ChangeAdd
+	if existed || basePresent {
+		kind = ChangeModify
+	}
+	return DiffFile(path, prior, proposed, kind), nil
+}
+
 // Build assembles the reviewable diff for a rebased pre-PR.
 //
 // The file list is derived from the packet's own entries, so it cannot disagree

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -53,6 +54,104 @@ func TestMiddlewareAuthenticatesSignedRequestAndRejectsReplay(t *testing.T) {
 		t.Fatalf("replay response = %d, want 401", replayResponse.Code)
 	}
 }
+
+func TestUploadAuthenticatorUsesDetachedMetadataSignatureWithoutReadingBody(t *testing.T) {
+	t.Parallel()
+
+	service := NewCredentialService(openCredentialDB(t), CredentialServiceConfig{ChallengeTTL: time.Minute, WriteGate: credentialTestWriteGate{}})
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := enrollKnownKey(t, service, "zara-key-upload", publicKey, privateKey)
+	middleware, err := NewMiddleware(service, MiddlewareConfig{MaxBodyBytes: 1024, SignatureTTL: time.Minute, ClockSkew: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := &uploadCountingBody{reader: strings.NewReader("asset bytes")}
+	request := httptest.NewRequest(http.MethodPut, "/v1/release-assets/0123456789abcdef0123456789abcdef/content", nil)
+	request.Host = "gitoversight.example"
+	request.Body = body
+	request.ContentLength = 11
+	request.Header.Set("Authorization", "Bearer one-use-capability")
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set(HeaderRepository, "yaniv256/private")
+	request.Header.Set(HeaderAssetSize, "11")
+	request.Header.Set(HeaderAssetSHA256, strings.Repeat("a", 64))
+	identity := Identity{TenantID: credential.TenantID, AgentID: credential.AgentID, CredentialID: credential.ID}
+	if err := SignUploadRequest(request, privateKey, identity, "upload-nonce-1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if body.reads != 0 {
+		t.Fatalf("signing read body %d times", body.reads)
+	}
+	got, nonce, _, err := middleware.UploadAuthenticator().Verify(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != identity {
+		t.Fatalf("identity = %+v", got)
+	}
+	if err := middleware.UploadAuthenticator().ConsumeNonce(request.Context(), got, nonce); err != nil {
+		t.Fatal(err)
+	}
+	if body.reads != 0 {
+		t.Fatalf("authentication read body %d times", body.reads)
+	}
+
+	replay := request.Clone(context.Background())
+	replay.Header = request.Header.Clone()
+	replay.Body = &uploadCountingBody{reader: strings.NewReader("asset bytes")}
+	replayIdentity, replayNonce, _, err := middleware.UploadAuthenticator().Verify(replay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := middleware.UploadAuthenticator().ConsumeNonce(replay.Context(), replayIdentity, replayNonce); err == nil {
+		t.Fatal("replayed detached signature accepted")
+	}
+}
+
+func TestUploadAuthenticatorBindsCapabilityAndContentMetadata(t *testing.T) {
+	t.Parallel()
+
+	service := NewCredentialService(openCredentialDB(t), CredentialServiceConfig{ChallengeTTL: time.Minute, WriteGate: credentialTestWriteGate{}})
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := enrollKnownKey(t, service, "zara-key-binding", publicKey, privateKey)
+	middleware, err := NewMiddleware(service, MiddlewareConfig{MaxBodyBytes: 1024, SignatureTTL: time.Minute, ClockSkew: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/v1/release-assets/0123456789abcdef0123456789abcdef/content", nil)
+	request.Host = "gitoversight.example"
+	request.ContentLength = 11
+	request.Header.Set("Authorization", "Bearer one-use-capability")
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set(HeaderRepository, "yaniv256/private")
+	request.Header.Set(HeaderAssetSize, "11")
+	request.Header.Set(HeaderAssetSHA256, strings.Repeat("a", 64))
+	identity := Identity{TenantID: credential.TenantID, AgentID: credential.AgentID, CredentialID: credential.ID}
+	if err := SignUploadRequest(request, privateKey, identity, "upload-nonce-binding", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(HeaderAssetSize, "12")
+	if _, _, _, err := middleware.UploadAuthenticator().Verify(request); err == nil {
+		t.Fatal("metadata-swapped detached signature accepted")
+	}
+}
+
+type uploadCountingBody struct {
+	reader io.Reader
+	reads  int
+}
+
+func (body *uploadCountingBody) Read(payload []byte) (int, error) {
+	body.reads++
+	return body.reader.Read(payload)
+}
+func (*uploadCountingBody) Close() error { return nil }
 
 func TestMiddlewareRejectsBodyTargetTenantAndForwardingDrift(t *testing.T) {
 	t.Parallel()
@@ -137,6 +236,77 @@ func TestMiddlewareRejectsRevokedCredentialAndOversizedBody(t *testing.T) {
 	handler.ServeHTTP(revokedResponse, revoked)
 	if revokedResponse.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked response = %d, want 401", revokedResponse.Code)
+	}
+}
+
+// A wrong -agent flag and a revoked credential must not be the same answer.
+//
+// They need OPPOSITE responses from the caller: one is a flag edit, the other
+// needs an admin to re-approve. The middleware used to return a bare
+// `unauthorized` for both, so the caller could not tell which, and the skill's
+// documented discriminator sent them to the admin either way.
+//
+// The pre-existing wrong-agent coverage in
+// TestMiddlewareRejectsBodyTargetTenantAndForwardingDrift asserted only
+// `Code == 401`, so it passed identically whether or not the two cases were
+// distinguishable. Asserting the rejection is not asserting the diagnosis —
+// this test asserts the responses DIFFER, which is the property that was
+// actually missing.
+//
+// The hint is safe here and nowhere earlier: it is emitted only after
+// verifier.Verify() succeeds, so the caller has already proven possession of the
+// credential's private key. Every pre-verification branch stays opaque, because
+// distinguishing "revoked" from "no such credential" to an unauthenticated
+// caller is a credential enumeration oracle.
+func TestWrongAgentFlagIsDistinguishableFromRevokedCredential(t *testing.T) {
+	t.Parallel()
+
+	service := NewCredentialService(openCredentialDB(t), CredentialServiceConfig{ChallengeTTL: time.Minute, WriteGate: credentialTestWriteGate{}})
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := enrollKnownKey(t, service, "zara-key-1", publicKey, privateKey)
+	middleware, err := NewMiddleware(service, MiddlewareConfig{MaxBodyBytes: 1024, SignatureTTL: time.Minute, ClockSkew: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := middleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+
+	// Elena's exact shape: correct key, correct credential id, WRONG agent id.
+	wrongAgent, err := http.NewRequest(http.MethodPost, "https://gitoversight.test/v1/operations", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongAgent.Header.Set("Content-Type", "application/json")
+	if err := SignRequest(wrongAgent, privateKey, Identity{TenantID: credential.TenantID, AgentID: "agent-" + credential.AgentID, CredentialID: credential.ID}, "nonce-wrong-agent-flag", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	wrongAgentResponse := httptest.NewRecorder()
+	handler.ServeHTTP(wrongAgentResponse, wrongAgent)
+	if wrongAgentResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong agent flag = %d, want 401", wrongAgentResponse.Code)
+	}
+	if !strings.Contains(wrongAgentResponse.Body.String(), "agent_id_mismatch") {
+		t.Fatalf("wrong -agent flag answered %q: it must NAME the mismatch, or the caller cannot tell a flag typo from a revoked credential and escalates to an admin for a fix they could make themselves", wrongAgentResponse.Body.String())
+	}
+
+	// Same credential, now revoked, correct agent id. Must stay opaque AND must
+	// not be confusable with the case above.
+	if err := service.Revoke(context.Background(), credential.TenantID, credential.ID, "yaniv"); err != nil {
+		t.Fatal(err)
+	}
+	revoked := signedRequest(t, privateKey, credential, "nonce-revoked-distinct", []byte(`{}`))
+	revokedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(revokedResponse, revoked)
+	if revokedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked = %d, want 401", revokedResponse.Code)
+	}
+	if strings.Contains(revokedResponse.Body.String(), "agent_id_mismatch") {
+		t.Fatalf("revoked credential answered %q: a revoked credential is not an agent mismatch, and mislabelling it sends the caller to edit a flag that is already correct", revokedResponse.Body.String())
+	}
+	if wrongAgentResponse.Body.String() == revokedResponse.Body.String() {
+		t.Fatalf("wrong -agent flag and revoked credential both answered %q — indistinguishable. These need opposite responses (edit a flag vs. get an admin), so one answer for both is what cost Elena hours on 2026-07-27", revokedResponse.Body.String())
 	}
 }
 

@@ -13,7 +13,10 @@ func (tx *Tx) PutHumanSession(ctx context.Context, session storage.HumanSession)
 	if session.TenantID == "" || session.IDHash == "" || session.CSRFHash == "" || session.CreatedAt.IsZero() || session.ExpiresAt.IsZero() {
 		return errors.New("human session is incomplete")
 	}
-	_, err := tx.tx.ExecContext(ctx, `INSERT INTO human_sessions (tenant_id, id_hash, human_id, csrf_hash, created_at, authenticated_at, recent_auth_until, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, session.TenantID, session.IDHash, nullableString(session.HumanID), session.CSRFHash, unix(session.CreatedAt), nullableTime(session.AuthenticatedAt), nullableTime(session.RecentAuthUntil), unix(session.ExpiresAt), nullableTime(session.RevokedAt))
+	// recent_auth_until is not written. The publish-time step-up it served was
+	// never a requirement and is gone; the column remains only because dropping
+	// it needs a migration, and it is now always NULL for new sessions.
+	_, err := tx.tx.ExecContext(ctx, `INSERT INTO human_sessions (tenant_id, id_hash, human_id, csrf_hash, created_at, authenticated_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, session.TenantID, session.IDHash, nullableString(session.HumanID), session.CSRFHash, unix(session.CreatedAt), nullableTime(session.AuthenticatedAt), unix(session.ExpiresAt), nullableTime(session.RevokedAt))
 	return err
 }
 
@@ -32,8 +35,8 @@ func (db *DB) HumanSession(ctx context.Context, tenantID, idHash string) (storag
 	var session storage.HumanSession
 	var humanID sql.NullString
 	var createdAt, expiresAt int64
-	var authenticatedAt, recentAuthUntil, revokedAt sql.NullInt64
-	err := db.sql.QueryRowContext(ctx, `SELECT tenant_id, id_hash, human_id, csrf_hash, created_at, authenticated_at, recent_auth_until, expires_at, revoked_at FROM human_sessions WHERE tenant_id = ? AND id_hash = ?`, tenantID, idHash).Scan(&session.TenantID, &session.IDHash, &humanID, &session.CSRFHash, &createdAt, &authenticatedAt, &recentAuthUntil, &expiresAt, &revokedAt)
+	var authenticatedAt, revokedAt sql.NullInt64
+	err := db.sql.QueryRowContext(ctx, `SELECT tenant_id, id_hash, human_id, csrf_hash, created_at, authenticated_at, expires_at, revoked_at FROM human_sessions WHERE tenant_id = ? AND id_hash = ?`, tenantID, idHash).Scan(&session.TenantID, &session.IDHash, &humanID, &session.CSRFHash, &createdAt, &authenticatedAt, &expiresAt, &revokedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storage.HumanSession{}, ErrNotFound
 	}
@@ -43,7 +46,6 @@ func (db *DB) HumanSession(ctx context.Context, tenantID, idHash string) (storag
 	session.HumanID = humanID.String
 	session.CreatedAt, session.ExpiresAt = fromUnix(createdAt), fromUnix(expiresAt)
 	session.AuthenticatedAt = optionalTime(authenticatedAt)
-	session.RecentAuthUntil = optionalTime(recentAuthUntil)
 	session.RevokedAt = optionalTime(revokedAt)
 	return session, nil
 }

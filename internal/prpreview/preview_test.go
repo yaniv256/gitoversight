@@ -21,6 +21,25 @@ func b64(content string) string { return base64.StdEncoding.EncodeToString([]byt
 
 func emptyBase(string) ([]byte, bool, error) { return nil, false, nil }
 
+func TestInspectRejectsOmittedChangedBlob(t *testing.T) {
+	packet := packetWith([]commitpacket.TreeEntry{{Path: "a.md", Mode: "100644", Type: "blob", SHA: "different"}}, nil)
+	_, err := prpreview.Inspect(packet, map[string]prpreview.BaseEntry{"a.md": {SHA: "old"}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "omits changed blob") {
+		t.Fatalf("Inspect error = %v, want omitted changed blob refusal", err)
+	}
+}
+
+func TestBuildFileRendersDeletedSubmoduleAsDeletion(t *testing.T) {
+	packet := packetWith([]commitpacket.TreeEntry{{Path: "vendor/lib", Mode: "160000", Type: "commit", Delete: true}}, nil)
+	diff, err := prpreview.BuildFile(packet, "vendor/lib", emptyBase, map[string]prpreview.BaseEntry{"vendor/lib": {SHA: strings.Repeat("a", 40), Mode: "160000", Type: "commit"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Kind != prpreview.ChangeDelete || diff.NewSHA != "" || diff.OldSHA != "" {
+		t.Fatalf("deleted submodule diff = %+v", diff)
+	}
+}
+
 // The file list a reviewer sees is derived from the packet, and ordered by path
 // exactly as GitHub sorts a PR's Files-changed tab (KTD10).
 func TestBuildOrdersFilesByPathLikeGitHub(t *testing.T) {

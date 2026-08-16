@@ -164,6 +164,20 @@ func approvedManifest(redirectURL string) Manifest {
 			"contents":       "write",
 			"issues":         "write",
 			"pull_requests":  "write",
+			// GitHub gates .github/workflows/ behind its own scope; contents:write
+			// does not imply it, on private repositories either. Without this the
+			// App cannot write CI ANYWHERE — the denial is global, fires as a
+			// generic 403 at POST /git/trees, and cannot distinguish an agent's own
+			// private repo from a public one.
+			//
+			// Withholding it does not buy a governance boundary, because the
+			// boundary already exists one layer up and is per-repository: a public
+			// repository reaches GitHub only through the human-approved sync flow
+			// (policy/evaluator.go:284 gates every public mutation on approval,
+			// whatever files it carries). The intended path for CI is exactly that
+			// — an agent edits the workflow on its private repo, proposes a sync,
+			// and a human approves the publication (2026-07-27).
+			"workflows": "write",
 		},
 		DefaultEvents: []string{
 			"issue_comment",

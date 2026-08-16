@@ -24,6 +24,7 @@ Use this skill before any agent-mediated GitHub write. Local reads, local commit
 3. Check repository ownership. An owner may perform permitted non-destructive private operations. A non-owner requires an exact branch-scoped contributor grant to push and open or update a PR from that branch.
 4. Classify the target visibility and operation. Every public write and every destructive operation requires exact human approval unless an explicit standing policy exception covers the exact repository and operation.
 5. Bind approval to the immutable packet: source and destination repositories, source commit, export tree, complete path manifest, title/body or reply text, operations, human approver, nonce, and expiration. Any material change invalidates approval.
+6. A configured policy orchestrator may add owners to an existing ordinary private repository through `policy-promote-private-owners`. This exception is addition-only: removals, public/protected repositories, writer changes, grants, repository registration, and every other policy change stay on the human-governed promotion path.
 6. Execute once through the broker and independently read GitHub state. Ambiguous outcomes reconcile before any retry.
 7. Record requested, denied or authorized, executed, and verified receipt events in the hash chain.
 

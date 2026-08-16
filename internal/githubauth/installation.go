@@ -191,7 +191,19 @@ func permissionsFor(operation string) (map[string]string, bool) {
 		return map[string]string{"contents": "read"}, true
 	case "pull_request.list":
 		return map[string]string{"pull_requests": "read"}, true
-	case "branch.push", "branch.delete", "policy.promote", "release.publish", "release.asset.upload":
+	case "branch.push":
+		// workflows:write is requested here and NOWHERE else, because branch.push
+		// is the only operation whose payload can carry a .github/workflows/ file.
+		//
+		// It must be named explicitly: the access_tokens endpoint treats this map
+		// as a DOWN-SCOPE, so the minted token holds only what is listed even when
+		// the installation was granted more. Granting the scope on GitHub is
+		// therefore necessary but NOT sufficient — a push carrying a workflow file
+		// still drew `403 Resource not accessible by integration` at POST
+		// /git/trees, indistinguishable from the ungranted case, until this line
+		// existed (2026-07-27).
+		return map[string]string{"contents": "write", "workflows": "write"}, true
+	case "branch.delete", "policy.promote", "release.publish", "release.asset.upload", "release.assets.upload":
 		return map[string]string{"contents": "write"}, true
 	case "pull_request.create", "pull_request.update", "pull_request.review", "pull_request.reply", "pull_request.close":
 		// pull_requests:write alone is scoped too narrow — opening/updating a PR

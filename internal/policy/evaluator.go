@@ -33,7 +33,7 @@ var operations = map[string]struct{}{
 	"branch.push": {}, "branch.delete": {}, "pull_request.create": {}, "pull_request.update": {},
 	"pull_request.review": {}, "pull_request.reply": {}, "pull_request.merge": {}, "pull_request.close": {},
 	"repository.create": {}, "repository.settings.update": {}, "installation.repository.add": {}, "policy.promote": {},
-	"release.publish": {}, "release.asset.upload": {}, "issue.create": {}, "issue.comment": {},
+	"release.publish": {}, "release.asset.upload": {}, "release.assets.upload": {}, "issue.create": {}, "issue.comment": {},
 	"repository.read": {},
 	"sync.propose":    {}, "sync.update": {}, "sync.comment": {}, "queue.set_order": {},
 }
@@ -42,7 +42,7 @@ var executableOperations = map[string]struct{}{
 	"branch.push": {}, "branch.delete": {}, "pull_request.create": {}, "pull_request.update": {},
 	"pull_request.review": {}, "pull_request.reply": {}, "pull_request.merge": {}, "pull_request.close": {},
 	"issue.create": {}, "issue.comment": {},
-	"policy.promote": {}, "release.publish": {}, "release.asset.upload": {},
+	"policy.promote": {}, "release.publish": {}, "release.asset.upload": {}, "release.assets.upload": {},
 	"repository.create": {}, "repository.settings.update": {}, "installation.repository.add": {},
 }
 
@@ -55,11 +55,26 @@ func Executable(operation string) bool {
 	return ok
 }
 
+type AgentKind string
+
+const (
+	AgentKindLocal  AgentKind = "local"
+	AgentKindRemote AgentKind = "remote"
+)
+
 type Agent struct {
-	UID       uint32   `json:"uid"`
-	FirstName string   `json:"first_name"`
-	Emails    []string `json:"emails"`
+	// Kind is omitted by legacy policies. An empty kind retains the historical
+	// local-agent meaning; remote agents have no Unix peer identity and must use
+	// an explicit remote kind.
+	Kind      AgentKind `json:"kind,omitempty"`
+	UID       uint32    `json:"uid"`
+	FirstName string    `json:"first_name"`
+	Emails    []string  `json:"emails"`
 }
+
+func (a Agent) IsRemote() bool { return a.Kind == AgentKindRemote }
+
+func (a Agent) IsLocal() bool { return a.Kind == "" || a.Kind == AgentKindLocal }
 
 // PermissionSet contains non-mutating repository capabilities. It is kept
 // separate from ownership and writer grants so a broad read default cannot
@@ -80,6 +95,10 @@ type Repository struct {
 	// publishes to via the human-authorized sync flow. Only valid on private
 	// repositories.
 	SyncsTo string `json:"syncs_to,omitempty"`
+	// Derived marks private authority created by a verified repository.create.
+	// It is never accepted from administrator policy documents.
+	Derived      bool   `json:"derived,omitempty"`
+	ActorSubject string `json:"-"`
 }
 
 type BranchGrant struct {
@@ -163,6 +182,15 @@ func (s Snapshot) Validate() error {
 	for name, agent := range s.Agents {
 		if name == "" || agent.FirstName == "" {
 			return errors.New("agent name and first name are required")
+		}
+		if !agent.IsLocal() && !agent.IsRemote() {
+			return fmt.Errorf("agent %s has invalid kind %q", name, agent.Kind)
+		}
+		if agent.IsRemote() {
+			if agent.UID != 0 {
+				return fmt.Errorf("remote agent %s must not declare a unix uid", name)
+			}
+			continue
 		}
 		if other, ok := seenUID[agent.UID]; ok {
 			return fmt.Errorf("agents %s and %s share uid %d", other, name, agent.UID)
@@ -259,6 +287,12 @@ func Evaluate(snapshot Snapshot, request Request) Decision {
 		return Decision{Code: BranchGrantRequired, Reason: "caller lacks standing on the mirror or its public target"}
 	}
 	if request.Operation == "repository.read" {
+		if repo.Derived {
+			if owner(snapshot, repo, request.Caller) {
+				return Decision{Code: AllowedRead, Reason: "derived repository owner may read"}
+			}
+			return Decision{Code: ReadDenied, Reason: "derived repository read is limited to its owner"}
+		}
 		permissions := snapshot.FallbackPermissions
 		if repo.Permissions != nil {
 			permissions = *repo.Permissions
@@ -331,12 +365,28 @@ func payloadContainsAgentIdentity(snapshot Snapshot, value any) bool {
 		}
 	case map[string]any:
 		for key, item := range typed {
+			// Commit packets carry changed blob bytes as base64 strings. Those
+			// strings are transport, not public attribution metadata, and random
+			// encoded bytes can contain an agent name by coincidence. The packet
+			// validator separately verifies the encoding and object SHA before
+			// execution; keep inspecting the blob descriptor and every other
+			// payload field, but do not interpret encoded bytes as prose.
+			if key == "content" && encodedBlob(typed) {
+				continue
+			}
 			if containsAgentIdentity(snapshot, key) || payloadContainsAgentIdentity(snapshot, item) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func encodedBlob(value map[string]any) bool {
+	encoding, encodingOK := value["encoding"].(string)
+	_, contentOK := value["content"].(string)
+	_, shaOK := value["sha"].(string)
+	return encodingOK && encoding == "base64" && contentOK && shaOK
 }
 
 // isPrivateContributorOperation reports whether the operation is a branch or
@@ -376,7 +426,7 @@ func owner(snapshot Snapshot, repo Repository, caller string) bool {
 // worker-observability branch proposed adding it, predating that rule.
 func destructive(operation string) bool {
 	switch operation {
-	case "repository.settings.update", "installation.repository.add", "policy.promote", "release.publish", "release.asset.upload":
+	case "repository.settings.update", "installation.repository.add", "policy.promote":
 		return true
 	default:
 		return false

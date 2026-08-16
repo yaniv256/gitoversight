@@ -30,7 +30,7 @@ func TestSearchRefreshWithoutCSRFRejected(t *testing.T) {
 	t.Parallel()
 	manager, session := refreshSession(t)
 	var calls int32
-	protected := manager.Protect(true, NewSearchHumanHandler(func() error {
+	protected := manager.Protect(NewSearchHumanHandler(func() error {
 		atomic.AddInt32(&calls, 1)
 		return nil
 	}))
@@ -50,7 +50,7 @@ func TestSearchRefreshFiresTriggerExactlyOnce(t *testing.T) {
 	t.Parallel()
 	manager, session := refreshSession(t)
 	var calls int32
-	protected := manager.Protect(true, NewSearchHumanHandler(func() error {
+	protected := manager.Protect(NewSearchHumanHandler(func() error {
 		atomic.AddInt32(&calls, 1)
 		return nil
 	}))

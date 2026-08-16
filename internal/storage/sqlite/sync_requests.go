@@ -2,9 +2,7 @@ package sqlite
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/storage"
+	"github.com/yaniv256/gitoversight.dev/internal/syncproposal"
 )
 
 // SyncRequest is the durable record of one private-mirror→public sync
@@ -43,19 +42,7 @@ type SyncRequest struct {
 // proposals could share one authorization. Length prefixes make the encoding
 // injective whatever the content.
 func SyncProposalHash(text string, files []string, packetSHA, packetJSON string) string {
-	digest := sha256.New()
-	write := func(value string) {
-		fmt.Fprintf(digest, "%d:", len(value))
-		digest.Write([]byte(value))
-	}
-	write(text)
-	fmt.Fprintf(digest, "%d|", len(files))
-	for _, file := range files {
-		write(file)
-	}
-	write(packetSHA)
-	write(packetJSON)
-	return hex.EncodeToString(digest.Sum(nil))
+	return syncproposal.Hash(text, files, packetSHA, packetJSON)
 }
 
 // legalSyncEdges DECLARES the post-authorization pipeline. It does not enforce

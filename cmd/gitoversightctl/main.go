@@ -19,6 +19,7 @@ import (
 
 	"github.com/yaniv256/gitoversight.dev/internal/agentauth"
 	"github.com/yaniv256/gitoversight.dev/internal/commitpacket"
+	"github.com/yaniv256/gitoversight.dev/internal/policy"
 )
 
 type remoteConfig struct {
@@ -56,7 +57,7 @@ func main() {
 
 func run(arguments []string, stdout, stderr io.Writer, client *http.Client) int {
 	if len(arguments) == 0 {
-		fmt.Fprintln(stderr, "command is required: identity-create, commit-packet, enroll, clone, request, execute, reconcile, status, receipt, revoke, pull-list, sync-propose, sync-update, sync-status, queue-order, or queue-top")
+		fmt.Fprintln(stderr, "command is required: identity-create, commit-packet, enroll, clone, request, release-asset-issue, release-asset-upload, release-asset-stage, release-asset-status, release-asset-abandon, execute, reconcile, status, receipt, revoke, pull-list, policy-promote, policy-promote-private-owners, sync-propose, sync-update, sync-status, queue-order, or queue-top")
 		return 1
 	}
 	var err error
@@ -72,8 +73,22 @@ func run(arguments []string, stdout, stderr io.Writer, client *http.Client) int 
 		status, err = runClone(arguments[1:], stdout, stderr, client)
 	case "request":
 		status, err = runRequest(arguments[1:], stdout, stderr, client)
+	case "release-asset-issue":
+		status, err = runReleaseAssetIssue(arguments[1:], stdout, stderr, client)
+	case "release-asset-upload":
+		status, err = runReleaseAssetUpload(arguments[1:], stdout, stderr, client)
+	case "release-asset-stage":
+		status, err = runReleaseAssetStage(arguments[1:], stdout, stderr, client)
+	case "release-asset-status":
+		status, err = runReleaseAssetLifecycle(http.MethodGet, arguments[1:], stdout, stderr, client)
+	case "release-asset-abandon":
+		status, err = runReleaseAssetLifecycle(http.MethodDelete, arguments[1:], stdout, stderr, client)
 	case "pull-list":
 		status, err = runPullList(arguments[1:], stdout, stderr, client)
+	case "policy-promote-private-owners":
+		status, err = runPolicyPromotePrivateOwners(arguments[1:], stdout, stderr, client)
+	case "policy-promote":
+		status, err = runPolicyPromote(arguments[1:], stdout, stderr, client)
 	case "sync-propose":
 		status, err = runSyncPropose(arguments[1:], stdout, stderr, client)
 	case "sync-update":
@@ -97,6 +112,49 @@ func run(arguments []string, stdout, stderr io.Writer, client *http.Client) int 
 		return 2
 	}
 	return 0
+}
+
+func runPolicyPromotePrivateOwners(arguments []string, stdout, stderr io.Writer, client *http.Client) (int, error) {
+	return runPolicyPromoteAt("policy-promote-private-owners", "/v1/policy/private-owner-additions", arguments, stdout, stderr, client)
+}
+
+func runPolicyPromote(arguments []string, stdout, stderr io.Writer, client *http.Client) (int, error) {
+	return runPolicyPromoteAt("policy-promote", "/v1/policy/orchestrator", arguments, stdout, stderr, client)
+}
+
+func runPolicyPromoteAt(commandName, endpoint string, arguments []string, stdout, stderr io.Writer, client *http.Client) (int, error) {
+	set := newFlags(commandName, stderr)
+	remote := addRemoteFlags(set)
+	snapshotFile := set.String("snapshot-file", "", "validated next policy snapshot JSON")
+	expectedGeneration := set.Uint64("expected-generation", 0, "active predecessor generation")
+	expectedPolicyHash := set.String("expected-policy-hash", "", "active predecessor policy hash")
+	if err := set.Parse(arguments); err != nil {
+		return 0, err
+	}
+	if err := remote.validate(); err != nil {
+		return 0, err
+	}
+	if *snapshotFile == "" || *expectedGeneration == 0 || *expectedPolicyHash == "" {
+		return 0, errors.New("snapshot-file, expected-generation, and expected-policy-hash are required")
+	}
+	payload, err := os.ReadFile(*snapshotFile)
+	if err != nil {
+		return 0, err
+	}
+	var snapshot policy.Snapshot
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&snapshot); err != nil {
+		return 0, fmt.Errorf("decode snapshot: %w", err)
+	}
+	if err := snapshot.Validate(); err != nil {
+		return 0, fmt.Errorf("validate snapshot: %w", err)
+	}
+	input := map[string]any{
+		"tenant_id": remote.TenantID, "expected_generation": *expectedGeneration,
+		"expected_policy_hash": *expectedPolicyHash, "snapshot": snapshot,
+	}
+	return signedJSON(client, *remote, http.MethodPost, endpoint, input, stdout)
 }
 
 func runClone(arguments []string, stdout, stderr io.Writer, client *http.Client) (int, error) {

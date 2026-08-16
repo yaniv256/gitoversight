@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 
@@ -17,53 +16,59 @@ import (
 // is escaped as text by html/template (KTD6 — diff content is authored by an
 // agent and must never reach the page as markup).
 type syncView struct {
-	Files        []prpreview.FileDiff
-	Warnings     []string
-	TotalAdded   int
-	TotalRemoved int
+	Files    []prpreview.FileDiff
+	Warnings []string
 	// Counts per change kind, for the summary bar.
 	AddedFiles, ModifiedFiles, DeletedFiles, SubmoduleFiles int
-	// AutoExpand opens every file's <details> when the change is small enough
-	// to read at once (KTD7).
-	AutoExpand bool
 	// Unavailable explains why no diff could be rendered. It is a REFUSAL, not
 	// an empty state: a page that silently shows no files where files exist
 	// would invite authorizing an unseen change.
 	Unavailable string
 }
 
-// diffLimitForExpand is the file count below which every diff opens by default.
-const diffLimitForExpand = 5
-
-// buildSyncView renders the stored pre-PR into reviewable diffs.
-//
-// base supplies the public repository's content per path. When it is nil the
-// view refuses rather than rendering a contentless file list — the previous
-// behavior, and the thing this whole feature exists to remove.
-func buildSyncView(sync sqlite.SyncRequest, base prpreview.BaseContent, identities []attribution.Identity) syncView {
+func decodeSyncPacket(sync sqlite.SyncRequest) (commitpacket.Packet, string) {
 	if strings.TrimSpace(sync.CommitPacketJSON) == "" {
-		return syncView{Unavailable: "This proposal carries no commit packet, so its contents cannot be shown. Do not authorize it."}
+		return commitpacket.Packet{}, "This proposal carries no commit packet, so its contents cannot be shown. Do not authorize it."
 	}
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(sync.CommitPacketJSON), &raw); err != nil {
-		return syncView{Unavailable: "The stored commit packet could not be read. Do not authorize it."}
+		return commitpacket.Packet{}, "The stored commit packet could not be read. Do not authorize it."
 	}
 	packet, present, err := commitpacket.Decode(raw)
 	if err != nil || !present {
-		return syncView{Unavailable: "The stored commit packet is not valid. Do not authorize it."}
+		return commitpacket.Packet{}, "The stored commit packet is not valid. Do not authorize it."
 	}
-	if base == nil {
+	return packet, ""
+}
+
+// buildSyncView builds a content-light review shell. It resolves the base tree
+// once but never reads a base blob or computes a line diff.
+func (handler *Handler) buildSyncView(sync sqlite.SyncRequest, identities []attribution.Identity) syncView {
+	packet, unavailable := decodeSyncPacket(sync)
+	if unavailable != "" {
+		return syncView{Unavailable: unavailable}
+	}
+	if handler.bases == nil || sync.PublicRepository == "" {
 		return syncView{Unavailable: "The public repository could not be read, so this change cannot be shown as a diff. Do not authorize it."}
 	}
-	preview, err := prpreview.Build(packet, packet.Tree.BaseTree, base, nil, identities)
+	base, err := handler.bases.ReadBase(workerrpc.BaseReadRequest{Repository: sync.PublicRepository, Branch: handler.baseBranch})
+	if err != nil {
+		return syncView{Unavailable: "The public repository could not be read, so this change cannot be shown as a diff. Do not authorize it."}
+	}
+	if packet.Tree.BaseTree != "" && base.TreeSHA != packet.Tree.BaseTree {
+		return syncView{Unavailable: "The public base moved after this proposal was created. Do not authorize it."}
+	}
+	entries := make(map[string]prpreview.BaseEntry, len(base.Entries))
+	for _, entry := range base.Entries {
+		entries[entry.Path] = prpreview.BaseEntry{SHA: entry.SHA, Mode: entry.Mode, Type: entry.Type}
+	}
+	preview, err := prpreview.Inspect(packet, entries, identities)
 	if err != nil {
 		return syncView{Unavailable: "This change could not be rendered as a diff: " + err.Error() + ". Do not authorize it."}
 	}
 
 	view := syncView{
 		Files: preview.Files, Warnings: preview.Warnings,
-		TotalAdded: preview.TotalAdded, TotalRemoved: preview.TotalRemoved,
-		AutoExpand: len(preview.Files) <= diffLimitForExpand,
 	}
 	for _, file := range preview.Files {
 		switch file.Kind {
@@ -106,36 +111,4 @@ func kindLabel(kind prpreview.ChangeKind) string {
 		return "submodule"
 	}
 	return string(kind)
-}
-
-// baseContentFor returns a reader for the public repository's current content,
-// or nil when the base cannot be resolved.
-//
-// Nil is deliberate and is NOT an empty result: buildSyncView turns it into a
-// visible refusal. A page that quietly rendered "no files" where files exist
-// would invite authorizing an unseen change — the exact failure this feature
-// exists to prevent.
-func (handler *Handler) baseContentFor(ctx context.Context, sync sqlite.SyncRequest) prpreview.BaseContent {
-	if handler.bases == nil || sync.PublicRepository == "" {
-		return nil
-	}
-	base, err := handler.bases.ReadBase(workerrpc.BaseReadRequest{Repository: sync.PublicRepository, Branch: handler.baseBranch})
-	if err != nil {
-		return nil
-	}
-	shaByPath := make(map[string]string, len(base.Entries))
-	for _, entry := range base.Entries {
-		shaByPath[entry.Path] = entry.SHA
-	}
-	return func(path string) ([]byte, bool, error) {
-		sha, present := shaByPath[path]
-		if !present {
-			return nil, false, nil
-		}
-		content, err := handler.bases.ReadBlob(sync.PublicRepository, sha)
-		if err != nil {
-			return nil, false, err
-		}
-		return content, true, nil
-	}
 }

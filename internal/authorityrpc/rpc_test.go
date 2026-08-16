@@ -52,7 +52,7 @@ func TestWorkerUsesNarrowAuthorityRPCWithoutDatabaseAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := authorityrpc.NewServer(filepath.Join(t.TempDir(), "authority.sock"), broker, uint32(os.Getuid()), "worker-a", os.Getgid())
+	service := authorityrpc.NewServer(filepath.Join(t.TempDir(), "authority.sock"), broker, uint32(os.Getuid()), "worker-a", "tenant-a", os.Getgid())
 	listener, err := service.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestAuthorityRPCRejectsWorkerIDDifferentFromGrantBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := authorityrpc.NewServer(filepath.Join(t.TempDir(), "authority.sock"), broker, uint32(os.Getuid()), "worker-b", os.Getgid())
+	service := authorityrpc.NewServer(filepath.Join(t.TempDir(), "authority.sock"), broker, uint32(os.Getuid()), "worker-b", "tenant-a", os.Getgid())
 	listener, err := service.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestAuthorityRPCRejectsWorkerIDDifferentFromGrantBinding(t *testing.T) {
 
 func TestAuthorityRPCSocketPermissionDriftFailsClosed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "authority.sock")
-	service := authorityrpc.NewServer(path, server.NewDurableBroker(nil), uint32(os.Getuid()), "worker-a", os.Getgid())
+	service := authorityrpc.NewServer(path, server.NewDurableBroker(nil), uint32(os.Getuid()), "worker-a", "tenant-a", os.Getgid())
 	listener, err := service.Listen()
 	if err != nil {
 		t.Fatal(err)

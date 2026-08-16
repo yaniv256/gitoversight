@@ -237,9 +237,8 @@ func TestSocketPermissionDriftFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if err := json.NewEncoder(connection).Encode(daemon.Request{SchemaVersion: 1, Action: "request", RequestID: "drift-1", Repository: "yaniv256/private", Operation: "pull_request.create"}); err != nil {
-		t.Fatal(err)
-	}
+	// Permission drift is rejected immediately after accept, before request decode.
+	// Read that connection-scoped response directly; writing here races the server's close.
 	var response daemon.Response
 	if err := json.NewDecoder(connection).Decode(&response); err != nil {
 		t.Fatal(err)

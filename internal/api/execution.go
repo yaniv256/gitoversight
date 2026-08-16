@@ -15,25 +15,43 @@ type PrivilegedRunner interface {
 }
 
 type ExecutionCoordinatorConfig struct {
-	WorkerID string
-	GrantTTL time.Duration
+	WorkerID      string
+	GrantTTL      time.Duration
+	ActivityStore ExecutionActivityStore
+}
+
+type ExecutionActivityStore interface {
+	BeginMaintenanceActivity(context.Context, string, time.Time) error
+	EndMaintenanceActivity(context.Context, string, time.Time) error
 }
 
 type ExecutionCoordinator struct {
-	broker   *server.DurableBroker
-	runner   PrivilegedRunner
-	workerID string
-	grantTTL time.Duration
+	broker        *server.DurableBroker
+	runner        PrivilegedRunner
+	activityStore ExecutionActivityStore
+	workerID      string
+	grantTTL      time.Duration
 }
 
 func NewExecutionCoordinator(broker *server.DurableBroker, runner PrivilegedRunner, config ExecutionCoordinatorConfig) *ExecutionCoordinator {
-	return &ExecutionCoordinator{broker: broker, runner: runner, workerID: config.WorkerID, grantTTL: config.GrantTTL}
+	return &ExecutionCoordinator{
+		broker: broker, runner: runner, activityStore: config.ActivityStore,
+		workerID: config.WorkerID, grantTTL: config.GrantTTL,
+	}
 }
 
-func (coordinator *ExecutionCoordinator) Execute(ctx context.Context, identity server.DurableIdentity, operationID string) (server.DurableResult, error) {
-	if coordinator == nil || coordinator.broker == nil || coordinator.runner == nil || coordinator.workerID == "" || coordinator.grantTTL <= 0 {
+func (coordinator *ExecutionCoordinator) Execute(ctx context.Context, identity server.DurableIdentity, operationID string) (result server.DurableResult, resultErr error) {
+	if coordinator == nil || coordinator.broker == nil || coordinator.runner == nil || coordinator.activityStore == nil ||
+		coordinator.workerID == "" || coordinator.grantTTL <= 0 {
 		return server.DurableResult{}, errors.New("execution coordinator is unavailable")
 	}
+	if err := coordinator.activityStore.BeginMaintenanceActivity(ctx, "execution", time.Now().UTC()); err != nil {
+		return server.DurableResult{}, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr,
+			coordinator.activityStore.EndMaintenanceActivity(context.Background(), "execution", time.Now().UTC()))
+	}()
 	packet, err := coordinator.broker.PrepareExecutionPacket(ctx, identity, operationID, coordinator.workerID, coordinator.grantTTL)
 	if err != nil {
 		return server.DurableResult{}, err
@@ -79,10 +97,18 @@ func withRunDetail(status server.DurableResult, runResult worker.Result) server.
 	return status
 }
 
-func (coordinator *ExecutionCoordinator) Reconcile(ctx context.Context, identity server.DurableIdentity, operationID string) (server.DurableResult, error) {
-	if coordinator == nil || coordinator.broker == nil || coordinator.runner == nil || coordinator.workerID == "" {
+func (coordinator *ExecutionCoordinator) Reconcile(ctx context.Context, identity server.DurableIdentity, operationID string) (result server.DurableResult, resultErr error) {
+	if coordinator == nil || coordinator.broker == nil || coordinator.runner == nil || coordinator.activityStore == nil ||
+		coordinator.workerID == "" {
 		return server.DurableResult{}, errors.New("execution coordinator is unavailable")
 	}
+	if err := coordinator.activityStore.BeginMaintenanceActivity(ctx, "reconciliation", time.Now().UTC()); err != nil {
+		return server.DurableResult{}, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr,
+			coordinator.activityStore.EndMaintenanceActivity(context.Background(), "reconciliation", time.Now().UTC()))
+	}()
 	packet, err := coordinator.broker.ReconciliationPacket(ctx, identity, operationID)
 	if err != nil {
 		return server.DurableResult{}, err

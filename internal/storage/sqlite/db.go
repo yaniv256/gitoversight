@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const CurrentSchemaVersion = 14
+const CurrentSchemaVersion = 24
 
 // PRAGMA integrity_check scans the whole database file, which takes multiple
 // seconds on a large production database — far over the readiness endpoint's

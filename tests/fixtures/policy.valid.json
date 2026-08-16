@@ -1,1 +1,0 @@
-{"schema_version":1,"generation":1,"repositories":[{"name":"yaniv256/actions.json.storage.public","visibility":"private","owners":["zara"],"authorized_writers":["zara"],"human_approvers":["yaniv"],"standing_exceptions":["branch.push","pull_request.create","pull_request.update","pull_request.review","pull_request.reply","pull_request.merge"]}]}

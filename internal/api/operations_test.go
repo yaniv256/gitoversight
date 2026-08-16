@@ -127,6 +127,191 @@ func TestPolicyPromotionRequiresHumanContextAndExactPredecessor(t *testing.T) {
 	}
 }
 
+func TestPolicyOrchestratorMayAddPrivateOwnerWithoutHumanContext(t *testing.T) {
+	broker := operationTestBroker(t)
+	handler := NewAuthorityHandler(broker, AuthorityHandlerConfig{
+		MaxBodyBytes: 16 << 10, PolicyOrchestrators: []string{"zara"},
+	})
+	currentStatus, err := broker.PolicyStatus(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := broker.PolicySnapshot(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := clonePolicySnapshot(t, current)
+	next.Generation++
+	next.Repositories["yaniv256/private"] = policy.Repository{
+		Visibility: "private", Owners: []string{"zara", "elena"}, Approvers: []string{"yaniv"},
+	}
+	body := policyPromotionInput{
+		TenantID: "tenant-a", ExpectedGeneration: currentStatus.Generation,
+		ExpectedPolicyHash: currentStatus.PolicyHash, Snapshot: next,
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/policy/private-owner-additions", jsonBody(t, body))
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(agentauth.WithIdentityForTrustedBoundary(request.Context(), agentauth.Identity{
+		TenantID: "tenant-a", AgentID: "zara", CredentialID: "zara-key-1",
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("private owner promotion = %d: %s", response.Code, response.Body.String())
+	}
+	active, err := broker.PolicySnapshot(context.Background(), "tenant-a")
+	if err != nil || active.Generation != 2 || !containsString(active.Repositories["yaniv256/private"].Owners, "elena") {
+		t.Fatalf("active policy = %+v, err = %v", active, err)
+	}
+}
+
+func TestPolicyOrchestratorMayPromoteAnyValidNextGenerationWithoutHumanContext(t *testing.T) {
+	broker := operationTestBroker(t)
+	handler := NewAuthorityHandler(broker, AuthorityHandlerConfig{
+		MaxBodyBytes: 16 << 10, PolicyOrchestrators: []string{"zara"},
+	})
+	currentStatus, err := broker.PolicyStatus(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := broker.PolicySnapshot(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := clonePolicySnapshot(t, current)
+	next.Generation++
+	private := next.Repositories["yaniv256/private"]
+	private.SyncsTo = "yaniv256/public"
+	next.Repositories["yaniv256/private"] = private
+	body := policyPromotionInput{
+		TenantID: "tenant-a", ExpectedGeneration: currentStatus.Generation,
+		ExpectedPolicyHash: currentStatus.PolicyHash, Snapshot: next,
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/policy/orchestrator", jsonBody(t, body))
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(agentauth.WithIdentityForTrustedBoundary(request.Context(), agentauth.Identity{
+		TenantID: "tenant-a", AgentID: "zara", CredentialID: "zara-key-1",
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("orchestrator policy promotion = %d: %s", response.Code, response.Body.String())
+	}
+	active, err := broker.PolicySnapshot(context.Background(), "tenant-a")
+	if err != nil || active.Generation != 2 || active.Repositories["yaniv256/private"].SyncsTo != "yaniv256/public" {
+		t.Fatalf("active policy = %+v, err = %v", active, err)
+	}
+}
+
+func TestPolicyOrchestratorPromotionRejectsInvalidSnapshotAndStalePredecessor(t *testing.T) {
+	broker := operationTestBroker(t)
+	handler := NewAuthorityHandler(broker, AuthorityHandlerConfig{
+		MaxBodyBytes: 16 << 10, PolicyOrchestrators: []string{"zara"},
+	})
+	currentStatus, err := broker.PolicyStatus(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := broker.PolicySnapshot(context.Background(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := clonePolicySnapshot(t, current)
+	next.Generation++
+	private := next.Repositories["yaniv256/private"]
+	private.SyncsTo = "*"
+	next.Repositories["yaniv256/private"] = private
+
+	for _, test := range []struct {
+		name               string
+		snapshot           policy.Snapshot
+		expectedGeneration uint64
+		expectedHash       string
+		want               int
+	}{
+		{"invalid snapshot", next, currentStatus.Generation, currentStatus.PolicyHash, http.StatusBadRequest},
+		{"stale predecessor", current, currentStatus.Generation + 1, currentStatus.PolicyHash, http.StatusConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := policyPromotionInput{TenantID: "tenant-a", ExpectedGeneration: test.expectedGeneration, ExpectedPolicyHash: test.expectedHash, Snapshot: test.snapshot}
+			request := httptest.NewRequest(http.MethodPost, "/v1/policy/orchestrator", jsonBody(t, body))
+			request.Header.Set("Content-Type", "application/json")
+			request = request.WithContext(agentauth.WithIdentityForTrustedBoundary(request.Context(), agentauth.Identity{TenantID: "tenant-a", AgentID: "zara", CredentialID: "zara-key-1"}))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.want {
+				t.Fatalf("status = %d, want %d: %s", response.Code, test.want, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestPolicyOrchestratorPromotionRejectsBroaderPolicyChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(policy.Snapshot)
+	}{
+		{"public owner", func(next policy.Snapshot) {
+			repository := next.Repositories["yaniv256/public"]
+			repository.Owners = append(repository.Owners, "elena")
+			next.Repositories["yaniv256/public"] = repository
+		}},
+		{"private owner removal", func(next policy.Snapshot) {
+			repository := next.Repositories["yaniv256/private"]
+			repository.Owners = []string{"elena"}
+			next.Repositories["yaniv256/private"] = repository
+		}},
+		{"writer addition", func(next policy.Snapshot) {
+			repository := next.Repositories["yaniv256/private"]
+			repository.Writers = []string{"elena"}
+			next.Repositories["yaniv256/private"] = repository
+		}},
+		{"unregistered owner", func(next policy.Snapshot) {
+			repository := next.Repositories["yaniv256/private"]
+			repository.Owners = append(repository.Owners, "unknown-agent")
+			next.Repositories["yaniv256/private"] = repository
+		}},
+		{"duplicate owner", func(next policy.Snapshot) {
+			repository := next.Repositories["yaniv256/private"]
+			repository.Owners = append(repository.Owners, repository.Owners[0])
+			next.Repositories["yaniv256/private"] = repository
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker := operationTestBroker(t)
+			current, err := broker.PolicySnapshot(context.Background(), "tenant-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := clonePolicySnapshot(t, current)
+			next.Generation++
+			test.mutate(next)
+			if err := validatePrivateOwnerAdditions(current, next); err == nil {
+				t.Fatal("broader policy change was accepted")
+			}
+		})
+	}
+}
+
+func TestPolicyOrchestratorEndpointRejectsOrdinaryAgent(t *testing.T) {
+	broker := operationTestBroker(t)
+	handler := NewAuthorityHandler(broker, AuthorityHandlerConfig{
+		MaxBodyBytes: 16 << 10, PolicyOrchestrators: []string{"zara"},
+	})
+	for _, path := range []string{"/v1/policy/private-owner-additions", "/v1/policy/orchestrator"} {
+		request := httptest.NewRequest(http.MethodPost, path, jsonBody(t, map[string]any{}))
+		request = request.WithContext(agentauth.WithIdentityForTrustedBoundary(request.Context(), agentauth.Identity{
+			TenantID: "tenant-a", AgentID: "elena", CredentialID: "elena-key-1",
+		}))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("ordinary agent on %s = %d: %s", path, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestOperationAPIRequiresHumanContextForExactApproval(t *testing.T) {
 	broker := operationTestBroker(t)
 	executor := &recordingOperationExecutor{}
@@ -221,6 +406,29 @@ func TestStructurallyInvalidOperationReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestAuthorizedSubmitWithoutExecutorPreservesExecutionUnavailableResponse(t *testing.T) {
+	handler := NewAuthorityHandler(operationTestBroker(t), AuthorityHandlerConfig{MaxBodyBytes: 4096})
+	request := httptest.NewRequest(http.MethodPost, "/v1/operations", jsonBody(t, map[string]any{
+		"id": "no-executor", "repository": "yaniv256/private", "operation": "branch.push",
+		"branch": "feat/no-executor", "manifest_hash": "manifest", "payload": map[string]any{"sha": "abc123"},
+	}))
+	request.Header.Set("Content-Type", "application/json")
+	request = request.WithContext(agentauth.WithIdentityForTrustedBoundary(request.Context(), agentauth.Identity{
+		TenantID: "tenant-a", AgentID: "zara", CredentialID: "zara-key-1",
+	}))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body["error"] != "execution_unavailable" {
+		t.Fatalf("body=%v err=%v", body, err)
+	}
+}
+
 type failingOperationExecutor struct{ err error }
 
 func (executor failingOperationExecutor) Execute(context.Context, server.DurableIdentity, string) (server.DurableResult, error) {
@@ -294,6 +502,19 @@ func jsonBody(t *testing.T, value any) *bytes.Reader {
 		t.Fatal(err)
 	}
 	return bytes.NewReader(payload)
+}
+
+func clonePolicySnapshot(t *testing.T, input policy.Snapshot) policy.Snapshot {
+	t.Helper()
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output policy.Snapshot
+	if err := json.Unmarshal(payload, &output); err != nil {
+		t.Fatal(err)
+	}
+	return output
 }
 
 // recordingQueue captures the (kind, ref) a decision clears, so a test can pin

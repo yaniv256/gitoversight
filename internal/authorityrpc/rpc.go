@@ -1,6 +1,7 @@
 package authorityrpc
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/identity"
+	"github.com/yaniv256/gitoversight.dev/internal/policy"
 	"github.com/yaniv256/gitoversight.dev/internal/server"
 )
 
@@ -38,8 +40,11 @@ type request struct {
 }
 
 type response struct {
-	Capability server.Capability `json:"capability,omitempty"`
-	Error      string            `json:"error,omitempty"`
+	Capability   server.Capability `json:"capability,omitempty"`
+	Repository   policy.Repository `json:"repository,omitempty"`
+	ActorSubject string            `json:"actor_subject,omitempty"`
+	Found        bool              `json:"found,omitempty"`
+	Error        string            `json:"error,omitempty"`
 }
 
 type Client struct{ path string }
@@ -84,6 +89,12 @@ func (client *Client) FinalizeReconciliation(tenantID, requestID, outcome, resou
 	return err
 }
 
+func (client *Client) ResolveRepository(repository string, now time.Time) (policy.Repository, bool, error) {
+	result, err := client.call(request{Action: "resolve_repository", Repository: repository, At: now})
+	result.Repository.ActorSubject = result.ActorSubject
+	return result.Repository, result.Found, err
+}
+
 func (client *Client) call(value request) (response, error) {
 	connection, err := net.DialTimeout("unix", client.path, time.Second)
 	if err != nil {
@@ -116,15 +127,16 @@ type Server struct {
 	broker    *server.DurableBroker
 	workerUID uint32
 	workerID  string
+	tenantID  string
 	socketGID int
 }
 
-func NewServer(path string, broker *server.DurableBroker, workerUID uint32, workerID string, socketGID int) *Server {
-	return &Server{path: path, broker: broker, workerUID: workerUID, workerID: workerID, socketGID: socketGID}
+func NewServer(path string, broker *server.DurableBroker, workerUID uint32, workerID, tenantID string, socketGID int) *Server {
+	return &Server{path: path, broker: broker, workerUID: workerUID, workerID: workerID, tenantID: tenantID, socketGID: socketGID}
 }
 
 func (service *Server) Listen() (net.Listener, error) {
-	if service.path == "" || service.broker == nil || service.workerID == "" || service.socketGID < 0 {
+	if service.path == "" || service.broker == nil || service.workerID == "" || service.tenantID == "" || service.socketGID < 0 {
 		return nil, errors.New("authority RPC configuration is incomplete")
 	}
 	_ = os.Remove(service.path)
@@ -212,6 +224,17 @@ func (service *Server) handle(connection net.Conn) {
 			return
 		}
 		service.respond(connection, response{})
+	case "resolve_repository":
+		if value.TenantID != "" || value.Repository == "" {
+			service.respond(connection, response{Error: "authority_request_invalid"})
+			return
+		}
+		repository, found, err := service.broker.ResolveRepository(context.Background(), service.tenantID, value.Repository)
+		if err != nil {
+			service.respond(connection, response{Error: "repository_authority_unavailable"})
+			return
+		}
+		service.respond(connection, response{Repository: repository, ActorSubject: repository.ActorSubject, Found: found})
 	default:
 		service.respond(connection, response{Error: "authority_action_invalid"})
 	}
