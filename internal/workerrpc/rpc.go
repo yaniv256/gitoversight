@@ -23,21 +23,26 @@ const (
 	// (Elena's ff-3, Dakota's meetuproom — both large-payload executes). Size this
 	// above the packet cap with headroom for JSON/RPC framing.
 	maxMessageBytes = 48 << 20
-	// requestTimeout must cover uploading a large packet's objects to GitHub
-	// (blobs -> tree -> commit), which for a many-blob packet exceeds 10s.
+	// requestTimeout bounds ordinary RPCs. Streamed release assets deliberately
+	// do not use a whole-call deadline: their approved size can approach
+	// GitHub's 2 GiB limit, so any fixed wall-clock cutoff becomes an accidental
+	// size limit on slower links.
 	requestTimeout = 120 * time.Second
 	maxConnections = 64
 )
 
 type request struct {
-	PullNumber    int64                `json:"pull_number,omitempty"`
-	Action        string               `json:"action"`
-	Request       worker.Request       `json:"request"`
-	Expectation   ApprovalExpectation  `json:"expectation,omitempty"`
-	OAuth         OAuthBeginRequest    `json:"oauth,omitempty"`
-	OAuthCallback OAuthCallbackRequest `json:"oauth_callback,omitempty"`
-	Base          BaseReadRequest      `json:"base,omitempty"`
-	Blob          BlobReadRequest      `json:"blob,omitempty"`
+	PullNumber     int64                     `json:"pull_number,omitempty"`
+	Action         string                    `json:"action"`
+	Request        worker.Request            `json:"request"`
+	Expectation    ApprovalExpectation       `json:"expectation,omitempty"`
+	OAuth          OAuthBeginRequest         `json:"oauth,omitempty"`
+	OAuthCallback  OAuthCallbackRequest      `json:"oauth_callback,omitempty"`
+	Base           BaseReadRequest           `json:"base,omitempty"`
+	Blob           BlobReadRequest           `json:"blob,omitempty"`
+	Snapshot       RepositorySnapshotRequest `json:"snapshot,omitempty"`
+	RepositoryBase RepositoryBaseRequest     `json:"repository_base,omitempty"`
+	Archive        RepositoryArchiveRequest  `json:"archive,omitempty"`
 }
 
 // BlobReadRequest fetches one object's content from a public repository, so a
@@ -56,7 +61,19 @@ type response struct {
 	OAuthCompletion  OAuthCompletion                `json:"oauth_completion,omitempty"`
 	Base             BaseRead                       `json:"base,omitempty"`
 	BlobContent      []byte                         `json:"blob_content,omitempty"`
+	Snapshot         RepositorySnapshotRead         `json:"snapshot,omitempty"`
+	RepositoryBase   RepositoryBaseRead             `json:"repository_base,omitempty"`
+	Archive          RepositoryArchiveRead          `json:"archive,omitempty"`
+	ReleaseAssets    ReleaseAssetReadiness          `json:"release_assets,omitempty"`
 	Error            string                         `json:"error,omitempty"`
+}
+
+// ReleaseAssetReadiness is bounded protocol/configuration metadata. It never
+// carries a filesystem path, staged descriptor, capability, or asset bytes.
+type ReleaseAssetReadiness struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	RootID          string `json:"root_id"`
+	Readable        bool   `json:"readable"`
 }
 
 // BaseReadRequest asks the worker for a public repository's current state — the
@@ -82,6 +99,67 @@ type BaseRead struct {
 type BaseReader interface {
 	ReadBase(BaseReadRequest) (BaseRead, error)
 	ReadBlob(repository, sha string) ([]byte, error)
+}
+
+// RepositorySnapshotRequest is an exact-base, bounded private repository read.
+// Tenant and agent are audit bindings supplied by the already-authenticated API
+// adapter; the worker independently enforces installation and private visibility.
+type RepositorySnapshotRequest struct {
+	TenantID       string `json:"tenant_id"`
+	AgentID        string `json:"agent_id"`
+	Repository     string `json:"repository"`
+	Ref            string `json:"ref"`
+	ExactCommitSHA string `json:"exact_commit_sha"`
+	MaxFiles       int    `json:"max_files"`
+	MaxFileBytes   int    `json:"max_file_bytes"`
+	MaxTotalBytes  int    `json:"max_total_bytes"`
+}
+
+type RepositorySnapshotEntry struct {
+	Path    string `json:"path"`
+	Mode    string `json:"mode"`
+	BlobSHA string `json:"blob_sha"`
+	Size    int64  `json:"size"`
+}
+
+type RepositorySnapshotRead struct {
+	Repository string                    `json:"repository"`
+	Ref        string                    `json:"ref"`
+	CommitSHA  string                    `json:"commit_sha"`
+	TreeSHA    string                    `json:"tree_sha"`
+	Entries    []RepositorySnapshotEntry `json:"entries"`
+}
+
+type RepositorySnapshotReader interface {
+	ReadRepositoryBase(RepositoryBaseRequest) (RepositoryBaseRead, error)
+	ReadRepositorySnapshot(RepositorySnapshotRequest) (RepositorySnapshotRead, error)
+	ReadRepositoryArchive(RepositoryArchiveRequest) (RepositoryArchiveRead, error)
+}
+
+type RepositoryBaseRequest struct {
+	TenantID   string `json:"tenant_id"`
+	AgentID    string `json:"agent_id"`
+	Repository string `json:"repository"`
+	Ref        string `json:"ref"`
+}
+
+type RepositoryBaseRead struct {
+	Repository string `json:"repository"`
+	Ref        string `json:"ref"`
+	CommitSHA  string `json:"commit_sha"`
+	TreeSHA    string `json:"tree_sha"`
+}
+
+type RepositoryArchiveRequest struct{ RepositorySnapshotRequest }
+
+type RepositoryArchiveRead struct {
+	Repository  string `json:"repository"`
+	Ref         string `json:"ref"`
+	CommitSHA   string `json:"commit_sha"`
+	TreeSHA     string `json:"tree_sha"`
+	ContentType string `json:"content_type"`
+	SHA256      string `json:"sha256"`
+	Content     []byte `json:"content"`
 }
 
 type Client struct {
@@ -130,8 +208,13 @@ func NewClient(path string) *Client {
 }
 
 func (c *Client) Ping() error {
-	_, err := c.call(request{Action: "ping"})
+	_, err := c.PingStatus()
 	return err
+}
+
+func (c *Client) PingStatus() (ReleaseAssetReadiness, error) {
+	result, err := c.call(request{Action: "ping"})
+	return result.ReleaseAssets, err
 }
 
 func (c *Client) Run(value worker.Request) (worker.Result, error) {
@@ -198,13 +281,30 @@ func (c *Client) ReadBlob(repository, sha string) ([]byte, error) {
 	return result.BlobContent, err
 }
 
+func (c *Client) ReadRepositorySnapshot(value RepositorySnapshotRequest) (RepositorySnapshotRead, error) {
+	result, err := c.call(request{Action: "repository_snapshot", Snapshot: value})
+	return result.Snapshot, err
+}
+
+func (c *Client) ReadRepositoryBase(value RepositoryBaseRequest) (RepositoryBaseRead, error) {
+	result, err := c.call(request{Action: "repository_base", RepositoryBase: value})
+	return result.RepositoryBase, err
+}
+
+func (c *Client) ReadRepositoryArchive(value RepositoryArchiveRequest) (RepositoryArchiveRead, error) {
+	result, err := c.call(request{Action: "repository_archive", Archive: value})
+	return result.Archive, err
+}
+
 func (c *Client) call(value request) (response, error) {
 	connection, err := net.DialTimeout("unix", c.path, 3*time.Second)
 	if err != nil {
 		return response{}, errors.New("privileged worker unavailable")
 	}
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(requestTimeout))
+	if value.Request.Operation != "release.asset.upload" && value.Request.Operation != "release.assets.upload" {
+		_ = connection.SetDeadline(time.Now().Add(requestTimeout))
+	}
 	requestErr := json.NewEncoder(connection).Encode(value)
 	var result response
 	decoder := json.NewDecoder(io.LimitReader(connection, maxMessageBytes))
@@ -226,15 +326,17 @@ func (c *Client) call(value request) (response, error) {
 }
 
 type Server struct {
-	path          string
-	brokerUID     uint32
-	expecter      ApprovalExpecter
-	oauth         OAuthBeginner
-	oauthComplete OAuthCompleter
-	runner        Runner
-	searchSync    func()
-	baseReader    BaseReader
-	failure       func(Failure)
+	path           string
+	brokerUID      uint32
+	expecter       ApprovalExpecter
+	oauth          OAuthBeginner
+	oauthComplete  OAuthCompleter
+	runner         Runner
+	searchSync     func()
+	baseReader     BaseReader
+	snapshotReader RepositorySnapshotReader
+	failure        func(Failure)
+	releaseAssets  func() ReleaseAssetReadiness
 }
 
 // Failure is the bounded, secret-free diagnostic surface for privileged
@@ -294,6 +396,12 @@ func WithFailureReporter(reporter func(Failure)) Option {
 	}
 }
 
+func WithReleaseAssetReadiness(readiness func() ReleaseAssetReadiness) Option {
+	return func(server *Server) {
+		server.releaseAssets = readiness
+	}
+}
+
 // actionsCarryingTheirOwnArguments are the actions whose parameters live OUTSIDE
 // the shared Request envelope — in Base, Blob, PullNumber, or in no payload at
 // all. The generic completeness gate demands Request.RequestID/Repository/
@@ -314,15 +422,18 @@ func WithFailureReporter(reporter func(Failure)) Option {
 // and it MUST validate its own required fields in its case body — the exemption
 // removes a check, so the case has to replace it.
 var actionsCarryingTheirOwnArguments = map[string]bool{
-	"ping":            true, // no payload
-	"expect_approval": true, // Approval
-	"oauth_begin":     true, // OAuth
-	"oauth_complete":  true, // OAuth
-	"pull_list":       true, // Request.Repository only
-	"pull_merged":     true, // Request.Repository + PullNumber
-	"search.sync":     true, // no payload
-	"read_base":       true, // Base
-	"read_blob":       true, // Blob
+	"ping":                true, // no payload
+	"expect_approval":     true, // Approval
+	"oauth_begin":         true, // OAuth
+	"oauth_complete":      true, // OAuth
+	"pull_list":           true, // Request.Repository only
+	"pull_merged":         true, // Request.Repository + PullNumber
+	"search.sync":         true, // no payload
+	"read_base":           true, // Base
+	"read_blob":           true, // Blob
+	"repository_snapshot": true, // Snapshot
+	"repository_base":     true, // RepositoryBase
+	"repository_archive":  true, // Archive
 }
 
 // requiresRequestEnvelope reports whether the generic completeness gate applies.
@@ -337,6 +448,10 @@ func WithBaseReader(reader BaseReader) Option {
 	return func(server *Server) {
 		server.baseReader = reader
 	}
+}
+
+func WithRepositorySnapshotReader(reader RepositorySnapshotReader) Option {
+	return func(server *Server) { server.snapshotReader = reader }
 }
 
 func NewServer(path string, brokerUID uint32, options ...Option) *Server {
@@ -400,7 +515,11 @@ func (s *Server) handle(connection net.Conn) {
 	}
 	switch value.Action {
 	case "ping":
-		s.respond(connection, response{})
+		status := ReleaseAssetReadiness{}
+		if s.releaseAssets != nil {
+			status = s.releaseAssets()
+		}
+		s.respond(connection, response{ReleaseAssets: status})
 	case "run":
 		if s.runner == nil || value.Request.Capability == "" {
 			s.respond(connection, response{Error: "worker_request_incomplete"})
@@ -491,6 +610,57 @@ func (s *Server) handle(connection net.Conn) {
 			return
 		}
 		s.respond(connection, response{BlobContent: content})
+	case "repository_snapshot":
+		if s.snapshotReader == nil {
+			s.respond(connection, response{Error: "repository_snapshot_unavailable"})
+			return
+		}
+		request := value.Snapshot
+		if request.TenantID == "" || request.AgentID == "" || request.Repository == "" || request.Ref == "" || request.ExactCommitSHA == "" || request.MaxFiles <= 0 || request.MaxFileBytes <= 0 || request.MaxTotalBytes <= 0 {
+			s.respond(connection, response{Error: "repository_snapshot_rejected"})
+			return
+		}
+		snapshot, err := s.snapshotReader.ReadRepositorySnapshot(request)
+		if err != nil {
+			s.reportFailure("repository_snapshot", worker.Request{TenantID: request.TenantID, Repository: request.Repository, Operation: "repository.read"}, err)
+			s.respond(connection, response{Error: "repository_snapshot_failed"})
+			return
+		}
+		s.respond(connection, response{Snapshot: snapshot})
+	case "repository_base":
+		if s.snapshotReader == nil {
+			s.respond(connection, response{Error: "repository_base_unavailable"})
+			return
+		}
+		request := value.RepositoryBase
+		if request.TenantID == "" || request.AgentID == "" || request.Repository == "" || request.Ref == "" {
+			s.respond(connection, response{Error: "repository_base_rejected"})
+			return
+		}
+		base, err := s.snapshotReader.ReadRepositoryBase(request)
+		if err != nil {
+			s.reportFailure("repository_base", worker.Request{TenantID: request.TenantID, Repository: request.Repository, Operation: "repository.read"}, err)
+			s.respond(connection, response{Error: "repository_base_failed"})
+			return
+		}
+		s.respond(connection, response{RepositoryBase: base})
+	case "repository_archive":
+		if s.snapshotReader == nil {
+			s.respond(connection, response{Error: "repository_archive_unavailable"})
+			return
+		}
+		request := value.Archive.RepositorySnapshotRequest
+		if request.TenantID == "" || request.AgentID == "" || request.Repository == "" || request.Ref == "" || request.ExactCommitSHA == "" || request.MaxFiles <= 0 || request.MaxFileBytes <= 0 || request.MaxTotalBytes <= 0 {
+			s.respond(connection, response{Error: "repository_archive_rejected"})
+			return
+		}
+		archive, err := s.snapshotReader.ReadRepositoryArchive(value.Archive)
+		if err != nil {
+			s.reportFailure("repository_archive", worker.Request{TenantID: request.TenantID, Repository: request.Repository, Operation: "repository.read"}, err)
+			s.respond(connection, response{Error: "repository_archive_failed"})
+			return
+		}
+		s.respond(connection, response{Archive: archive})
 	case "expect_approval":
 		if s.expecter == nil {
 			s.respond(connection, response{Error: "approval_expectation_unavailable"})

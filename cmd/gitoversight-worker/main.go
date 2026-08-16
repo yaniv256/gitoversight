@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/authorityrpc"
@@ -22,6 +23,8 @@ import (
 	"github.com/yaniv256/gitoversight.dev/internal/githubauth"
 	"github.com/yaniv256/gitoversight.dev/internal/gitread"
 	"github.com/yaniv256/gitoversight.dev/internal/oauthflow"
+	"github.com/yaniv256/gitoversight.dev/internal/policy"
+	"github.com/yaniv256/gitoversight.dev/internal/releaseasset"
 	"github.com/yaniv256/gitoversight.dev/internal/searchstore"
 	"github.com/yaniv256/gitoversight.dev/internal/searchsync"
 	"github.com/yaniv256/gitoversight.dev/internal/tokenvault"
@@ -53,12 +56,45 @@ type config struct {
 	// deployments without the new config keys keep working unchanged.
 	SearchDBPath       string `json:"search_db_path"`
 	SearchSyncInterval string `json:"search_sync_interval"`
+	ReleaseAssetRoot   string `json:"release_asset_root"`
 }
 
 type repositoryOAuthBeginner struct {
 	coordinator        oauthCoordinator
 	installations      map[string]int64
 	humanInstallations map[string]int64
+}
+
+type repositoryTokenProvider interface {
+	Token(string) (string, error)
+}
+
+type repositoryAuthorityResolver interface {
+	ResolveRepository(string, time.Time) (policy.Repository, bool, error)
+}
+
+type derivedRepositoryReadMinter struct {
+	installations repositoryTokenProvider
+	humans        repositoryTokenProvider
+	authority     repositoryAuthorityResolver
+}
+
+func (m derivedRepositoryReadMinter) Token(subject string) (string, error) {
+	repository, operation, ok := strings.Cut(subject, "\x00")
+	if !ok || operation != "repository.read" {
+		return "", errors.New("repository read token scope is invalid")
+	}
+	resolved, found, err := m.authority.ResolveRepository(repository, time.Now().UTC())
+	if err != nil || !found {
+		return "", errors.New("repository read authority unavailable")
+	}
+	if resolved.Derived {
+		if resolved.ActorSubject == "" {
+			return "", errors.New("derived repository human actor is unavailable")
+		}
+		return m.humans.Token(resolved.ActorSubject)
+	}
+	return m.installations.Token(subject)
 }
 
 type pullListRunner struct {
@@ -149,7 +185,21 @@ func main() {
 	if err != nil {
 		fatal("create installation token minter: %v", err)
 	}
-	gitReadHandler, err := gitread.NewHandler(cfg.GitHubGitBaseURL, gitHTTPClient, minter)
+	clientSecret, err := loadSecretFile(cfg.GitHubAppSecretFile, 16)
+	if err != nil {
+		fatal("load GitHub App client secret: %v", err)
+	}
+	clientSecret = bytes.TrimSpace(clientSecret)
+	userTokens, err := githubauth.NewUserTokenProvider(cfg.GitHubOAuthBaseURL, cfg.GitHubAppClientID, string(clientSecret), httpClient, vault)
+	if err != nil {
+		fatal("create human token provider: %v", err)
+	}
+	authorityClient := authorityrpc.NewClient(cfg.AuthoritySocket)
+	gitReadHandler, err := gitread.NewHandler(cfg.GitHubGitBaseURL, gitHTTPClient, derivedRepositoryReadMinter{
+		installations: minter,
+		humans:        userTokens,
+		authority:     authorityClient,
+	})
 	if err != nil {
 		fatal("create repository read proxy: %v", err)
 	}
@@ -164,15 +214,6 @@ func main() {
 			fatal("repository read proxy: %v", serveErr)
 		}
 	}()
-	clientSecret, err := loadSecretFile(cfg.GitHubAppSecretFile, 16)
-	if err != nil {
-		fatal("load GitHub App client secret: %v", err)
-	}
-	clientSecret = bytes.TrimSpace(clientSecret)
-	userTokens, err := githubauth.NewUserTokenProvider(cfg.GitHubOAuthBaseURL, cfg.GitHubAppClientID, string(clientSecret), httpClient, vault)
-	if err != nil {
-		fatal("create human token provider: %v", err)
-	}
 	oauthCoordinator, err := oauthflow.New(oauthflow.Config{OAuthBaseURL: cfg.GitHubOAuthBaseURL, APIBaseURL: cfg.GitHubBaseURL, ClientID: cfg.GitHubAppClientID, ClientSecret: string(clientSecret), RedirectURI: cfg.GitHubOAuthRedirect, MaxConcurrent: cfg.OAuthMaxConcurrent}, httpClient, vault)
 	if err != nil {
 		fatal("create OAuth coordinator: %v", err)
@@ -198,20 +239,44 @@ func main() {
 		}
 	}
 	visibility := func(repository string) (string, error) {
-		value, ok := cfg.Repositories[repository]
-		if !ok || (value != "private" && value != "public") {
+		resolved, ok, err := authorityClient.ResolveRepository(repository, time.Now().UTC())
+		if err != nil || !ok || (resolved.Visibility != "private" && resolved.Visibility != "public") {
 			return "", errors.New("repository visibility unavailable")
 		}
-		return value, nil
+		return resolved.Visibility, nil
 	}
 	client, err := githubapp.New(cfg.GitHubBaseURL, httpClient, tokens, visibility)
 	if err != nil {
 		fatal("create GitHub client: %v", err)
 	}
-	executor := githubapp.NewExecutor(client)
-	runner := &pullListRunner{Worker: worker.New(authorityrpc.NewClient(cfg.AuthoritySocket), executor), executor: executor}
+	var executor *githubapp.Executor
+	releaseAssetReadiness := func() workerrpc.ReleaseAssetReadiness {
+		return workerrpc.ReleaseAssetReadiness{}
+	}
+	if cfg.ReleaseAssetRoot != "" {
+		releaseAssetReader, err := releaseasset.NewFileReader(cfg.ReleaseAssetRoot)
+		if err != nil {
+			fatal("open release asset reader: %v", err)
+		}
+		executor = githubapp.NewExecutorWithBlobReader(client, releaseAssetReader)
+		releaseAssetReadiness = func() workerrpc.ReleaseAssetReadiness {
+			return workerrpc.ReleaseAssetReadiness{
+				ProtocolVersion: releaseasset.ProtocolVersion,
+				RootID:          releaseAssetReader.RootID(),
+				Readable:        releaseAssetReader.ReaderReadiness() == nil,
+			}
+		}
+	} else {
+		// Compatibility for installations that have not deployed streamed
+		// staging yet. Descriptor operations fail closed in the executor.
+		executor = githubapp.NewExecutor(client)
+	}
+	runner := &pullListRunner{Worker: worker.New(authorityClient, executor), executor: executor}
 	oauthService := &repositoryOAuthBeginner{coordinator: oauthCoordinator, installations: cfg.Installations, humanInstallations: cfg.HumanInstallations}
-	serviceOptions := []workerrpc.Option{workerrpc.WithRunner(runner), workerrpc.WithOAuthBeginner(oauthService), workerrpc.WithOAuthCompleter(oauthService)}
+	serviceOptions := []workerrpc.Option{
+		workerrpc.WithRunner(runner), workerrpc.WithOAuthBeginner(oauthService),
+		workerrpc.WithOAuthCompleter(oauthService), workerrpc.WithReleaseAssetReadiness(releaseAssetReadiness),
+	}
 	// Pre-PR base resolution: the API asks the worker what a public repository
 	// currently looks like, because credentials live here and not there.
 	if baseIDs := installationIDs(cfg.Installations); len(baseIDs) > 0 {
@@ -224,6 +289,11 @@ func main() {
 			fatal("create base resolver: %v", err)
 		}
 		serviceOptions = append(serviceOptions, workerrpc.WithBaseReader(resolver))
+		snapshotResolver, err := newRepositorySnapshotResolver(baseReader, cfg.Installations, visibility)
+		if err != nil {
+			fatal("create repository snapshot resolver: %v", err)
+		}
+		serviceOptions = append(serviceOptions, workerrpc.WithRepositorySnapshotReader(snapshotResolver))
 	}
 	if cfg.SearchDBPath != "" {
 		searchInterval := time.Hour

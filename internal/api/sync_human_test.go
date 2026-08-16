@@ -15,6 +15,7 @@ import (
 	"github.com/yaniv256/gitoversight.dev/internal/githubapp"
 	"github.com/yaniv256/gitoversight.dev/internal/policy"
 	"github.com/yaniv256/gitoversight.dev/internal/server"
+	"github.com/yaniv256/gitoversight.dev/internal/storage"
 	"github.com/yaniv256/gitoversight.dev/internal/storage/sqlite"
 	"github.com/yaniv256/gitoversight.dev/internal/workerrpc"
 )
@@ -136,6 +137,9 @@ func TestAuthorizeRunsFullChain(t *testing.T) {
 	}
 	if len(authority.submitted) != 2 || authority.submitted[0].Operation != "branch.push" || authority.submitted[1].Operation != "pull_request.create" {
 		t.Fatalf("submitted = %+v", authority.submitted)
+	}
+	if authority.submitted[0].Branch != "sync/"+shortSHA(hash) || strings.Contains(authority.submitted[0].Branch, req.CreatedBy) {
+		t.Fatalf("public branch = %q, want content-derived branch without private agent attribution", authority.submitted[0].Branch)
 	}
 	if authority.submitted[1].Body != req.ProposalText {
 		t.Fatalf("public PR body = %q, want authorized text", authority.submitted[1].Body)
@@ -620,5 +624,91 @@ func TestCommentAcceptsTheBodyShapeTheBrowserActuallySends(t *testing.T) {
 	}
 	if len(thread) != 1 || thread[0].Body != "typed in the browser" {
 		t.Fatalf("comment body lost in translation: %+v", thread)
+	}
+}
+
+// A push that already succeeded must be SKIPPED on retry, not re-submitted.
+//
+// The publication of 302 files outran GitHub's read replica: the immediate
+// reconcile said "absent", KTD1a correctly parked the operation indeterminate
+// rather than calling a negative read terminal, and the chain treated "cannot
+// confirm yet" as "failed" — aborting before the pull request existed.
+//
+// Retrying then hit the replay guard: "operation id was already submitted".
+// That guard is CORRECT — re-submitting an executed public write is exactly
+// what it prevents. The defect was asking to re-run a completed step at all.
+//
+// Live 2026-07-27: branch pushed with all 302 files, push reconciled VERIFIED,
+// no pull request, and every retry denied. Publication was complete except for
+// its final step and unreachable by any route the reviewer had.
+func TestAuthorizeResumesPastAnAlreadyVerifiedPush(t *testing.T) {
+	t.Parallel()
+	db := humanSyncDB(t)
+	req := seedProposal(t, db, "s-resume")
+	// Seed a REAL verified push operation. The earlier version of this test
+	// stubbed the reconciler instead, which is why it passed against a check
+	// that consulted the wrong source: production reads the operation's stored
+	// state, and Reconcile REFUSES a verified operation ("not indeterminate").
+	// A fixture that fakes the probe cannot detect the probe being wrong.
+	if err := db.WithTx(context.Background(), func(tx *sqlite.Tx) error {
+		if err := tx.EnsureAgent(context.Background(), "default", "zara", time.Unix(1_800_000_000, 0)); err != nil {
+			return err
+		}
+		return tx.PutOperation(context.Background(), storage.Operation{
+			TenantID: "default", ID: "s-resume-push", AgentID: "zara",
+			Repository: "yaniv256/mirror", Kind: "branch.push", PacketHash: "seeded-resume-packet",
+			State: string(server.DurableVerified), PolicyGeneration: 1,
+			CreatedAt: time.Unix(1_800_000_000, 0), ExpiresAt: time.Unix(1_900_000_000, 0),
+			UpdatedAt: time.Unix(1_800_000_000, 0),
+		})
+	}); err != nil {
+		t.Fatalf("seed verified push: %v", err)
+	}
+	authority := &fakeAuthority{resource: "pull_request:77"}
+	handler := NewSyncHumanHandler(SyncHumanHandlerConfig{Policy: humanPolicy(), Store: db, Broker: authority, Executor: authority})
+	hash := sqlite.SyncProposalHash(req.ProposalText, req.FileManifest, req.PacketHeadSHA, req.CommitPacketJSON)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, humanPost("/v1/human/sync/s-resume/authorize", `{"packet_hash":"`+hash+`"}`))
+	if response.Code != http.StatusOK {
+		t.Fatalf("authorize = %d body=%s", response.Code, response.Body.String())
+	}
+	for _, submitted := range authority.submitted {
+		if submitted.Operation == "branch.push" {
+			t.Fatal("re-submitted a push that had already been verified — the replay guard will deny this and publication stalls one step from done")
+		}
+	}
+	if len(authority.submitted) != 1 || authority.submitted[0].Operation != "pull_request.create" {
+		t.Fatalf("expected the chain to resume at pull_request.create, submitted = %+v", authority.submitted)
+	}
+}
+
+func TestAuthorizeRetriesTerminalDeniedPushWithFreshOperationID(t *testing.T) {
+	t.Parallel()
+	db := humanSyncDB(t)
+	req := seedProposal(t, db, "s-denied-retry")
+	if err := db.WithTx(context.Background(), func(tx *sqlite.Tx) error {
+		if err := tx.EnsureAgent(context.Background(), "default", "zara", time.Unix(1_800_000_000, 0)); err != nil {
+			return err
+		}
+		return tx.PutOperation(context.Background(), storage.Operation{
+			TenantID: "default", ID: "s-denied-retry-push", AgentID: "zara",
+			Repository: "yaniv256/mirror", Kind: "branch.push", PacketHash: "denied-packet",
+			State: string(server.DurableDenied), PolicyGeneration: 1, Reason: "policy defect",
+			CreatedAt: time.Unix(1_800_000_000, 0), ExpiresAt: time.Unix(1_900_000_000, 0),
+			UpdatedAt: time.Unix(1_800_000_000, 0),
+		})
+	}); err != nil {
+		t.Fatalf("seed denied push: %v", err)
+	}
+	authority := &fakeAuthority{resource: "pull_request:78"}
+	handler := NewSyncHumanHandler(SyncHumanHandlerConfig{Policy: humanPolicy(), Store: db, Broker: authority, Executor: authority})
+	hash := sqlite.SyncProposalHash(req.ProposalText, req.FileManifest, req.PacketHeadSHA, req.CommitPacketJSON)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, humanPost("/v1/human/sync/s-denied-retry/authorize", `{"packet_hash":"`+hash+`"}`))
+	if response.Code != http.StatusOK {
+		t.Fatalf("authorize = %d body=%s", response.Code, response.Body.String())
+	}
+	if len(authority.submitted) != 2 || authority.submitted[0].ID != "s-denied-retry-push-retry-1" {
+		t.Fatalf("submitted = %+v, want fresh retry push followed by PR", authority.submitted)
 	}
 }

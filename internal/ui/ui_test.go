@@ -24,6 +24,7 @@ import (
 	"github.com/yaniv256/gitoversight.dev/internal/storage/sqlite"
 	"github.com/yaniv256/gitoversight.dev/internal/ui"
 	"github.com/yaniv256/gitoversight.dev/internal/worker"
+	"github.com/yaniv256/gitoversight.dev/internal/workerrpc"
 )
 
 func uiDB(t *testing.T) *sqlite.DB {
@@ -94,13 +95,59 @@ func TestNowRendersTopItemWithDepth(t *testing.T) {
 	}
 }
 
+type refusingPostReviewBases struct {
+	readBaseCalls int32
+}
+
+func (bases *refusingPostReviewBases) ReadBase(workerrpc.BaseReadRequest) (workerrpc.BaseRead, error) {
+	atomic.AddInt32(&bases.readBaseCalls, 1)
+	return workerrpc.BaseRead{}, errors.New("post-review base read must not happen")
+}
+
+func (*refusingPostReviewBases) ReadBlob(string, string) ([]byte, error) {
+	return nil, errors.New("post-review blob read must not happen")
+}
+
+func TestPublicPRPageDoesNotRebuildAuthorizationDiff(t *testing.T) {
+	t.Parallel()
+	db := uiDB(t)
+	seedSyncState(t, db, "published-sync", "public_pr_created")
+	bases := &refusingPostReviewBases{}
+	handler, err := ui.NewHandler(ui.Config{Store: db, Bases: bases})
+	if err != nil {
+		t.Fatalf("new handler: %v", err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, uiGet("/ui/sync/published-sync"))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if calls := atomic.LoadInt32(&bases.readBaseCalls); calls != 0 {
+		t.Fatalf("post-review page made %d base reads, want 0", calls)
+	}
+	if !strings.Contains(response.Body.String(), "Open PR #55 on GitHub") {
+		t.Fatalf("merge action missing: %s", response.Body.String())
+	}
+}
+
 func TestUIWithoutApproverRedirects(t *testing.T) {
 	t.Parallel()
 	handler, _ := ui.NewHandler(ui.Config{Store: uiDB(t)})
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ui/now", nil))
-	if response.Code != http.StatusFound || response.Header().Get("Location") != "/login/github" {
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "/login/github?return_to=%2Fui%2Fnow" {
 		t.Fatalf("status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func TestDirectSyncReviewPreservesDestinationAcrossLogin(t *testing.T) {
+	t.Parallel()
+	handler, _ := ui.NewHandler(ui.Config{Store: uiDB(t)})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ui/sync/review-123?section=files", nil))
+	want := "/login/github?return_to=%2Fui%2Fsync%2Freview-123%3Fsection%3Dfiles"
+	if response.Code != http.StatusFound || response.Header().Get("Location") != want {
+		t.Fatalf("status=%d location=%q want=%q", response.Code, response.Header().Get("Location"), want)
 	}
 }
 
@@ -233,7 +280,7 @@ func TestSearchPageWithoutApproverRedirects(t *testing.T) {
 	handler := searchUIHandler(t, filepath.Join(t.TempDir(), "search.db"))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ui/search", nil))
-	if response.Code != http.StatusFound || response.Header().Get("Location") != "/login/github" {
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "/login/github?return_to=%2Fui%2Fsearch" {
 		t.Fatalf("status=%d location=%q", response.Code, response.Header().Get("Location"))
 	}
 }

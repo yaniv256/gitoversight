@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -88,5 +89,29 @@ func TestReadSessionHonorsExplicitRepositoryDenial(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("denied read = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestReadSessionUsesLivePolicyResolver(t *testing.T) {
+	snapshot := policy.Snapshot{
+		Generation:   1,
+		Agents:       map[string]policy.Agent{"tomas": {UID: 1005, FirstName: "Tomas"}},
+		Repositories: map[string]policy.Repository{},
+	}
+	handler, err := api.NewReadHandler(api.ReadHandlerConfig{
+		PolicyResolver: func(context.Context) (policy.Snapshot, error) { return snapshot, nil },
+		SessionTTL:     time.Minute, GitBaseURL: "https://gitoversight.test/git", GitProxy: http.NotFoundHandler(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Repositories["yaniv256/new-private"] = policy.Repository{Visibility: "private", Owners: []string{"tomas"}, Derived: true}
+	body, _ := json.Marshal(map[string]string{"repository": "yaniv256/new-private"})
+	request := httptest.NewRequest(http.MethodPost, "/v1/read-sessions", bytes.NewReader(body))
+	request = request.WithContext(agentauth.WithIdentityForTrustedBoundary(request.Context(), agentauth.Identity{TenantID: "tenant-a", AgentID: "tomas"}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", response.Code, response.Body.String())
 	}
 }

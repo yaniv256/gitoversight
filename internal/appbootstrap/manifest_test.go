@@ -3,6 +3,7 @@ package appbootstrap
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,7 @@ func TestPrepareManifestPacketBuildsExactPrivateAppContract(t *testing.T) {
 		"contents":       "write",
 		"issues":         "write",
 		"pull_requests":  "write",
+		"workflows":      "write",
 	}
 	if packet.Manifest.Name != ApprovedAppName || packet.Manifest.URL != ApprovedHomepageURL || packet.Manifest.Public {
 		t.Fatalf("manifest identity = %#v", packet.Manifest)
@@ -83,6 +85,67 @@ func TestPrepareManifestPacketRejectsUntrustedRedirects(t *testing.T) {
 	}
 }
 
+// TestManifestContractRejectsPermissionDriftWithoutTheDigest exercises
+// validateManifest DIRECTLY, and it exists because the digest was hiding it.
+//
+// TestValidateManifestPacketRejectsAnyAuthorityDrift below goes through
+// ValidateManifestPacket, which hashes the whole packet BEFORE comparing the
+// manifest to the approved contract. Every mutation there breaks the digest
+// first, so the drift assertion never reaches the permission comparison:
+// replacing validateManifest's contract check with `if false && ...` leaves
+// that test GREEN (verified 2026-07-27). It proves the digest rejects
+// tampering — a real property, but not the one its name claims.
+//
+// The gap matters because a digest cannot defend approvedManifest() from
+// itself: the digest is computed FROM whatever that function returns, so
+// drift authored INTO the contract hashes cleanly and ships. Only a direct
+// comparison catches it. Same shape as the `Code == 401` blindness in
+// agentauth — an assertion that passes for a reason other than the one it
+// names.
+func TestManifestContractRejectsPermissionDriftWithoutTheDigest(t *testing.T) {
+	t.Parallel()
+	const redirect = "https://app.gitoversight.com/bootstrap/github-app/callback"
+	approved := approvedManifest(redirect)
+
+	if err := validateManifest(approved); err != nil {
+		t.Fatalf("the approved manifest must validate against itself: %v", err)
+	}
+	// The permission set the App is actually granted. Spelled out here rather
+	// than derived, so a change to approvedManifest must be made deliberately
+	// in two places instead of silently agreeing with itself.
+	want := map[string]string{
+		"administration": "write",
+		"contents":       "write",
+		"issues":         "write",
+		"pull_requests":  "write",
+		// Added 2026-07-27. Withholding it blocked EVERY .github/workflows/
+		// write, on private repositories too, as a generic 403 at
+		// POST /git/trees. The governance boundary lives one layer up and is
+		// per-repository: public publication is gated on human approval.
+		"workflows": "write",
+	}
+	if !mapsEqual(approved.DefaultPermissions, want) {
+		t.Fatalf("granted permissions = %#v, want %#v — a permission change must be a deliberate edit to BOTH the contract and this test", approved.DefaultPermissions, want)
+	}
+
+	for _, drift := range []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"an extra permission the App has no business holding", func(m *Manifest) { m.DefaultPermissions["members"] = "write" }},
+		{"a granted permission silently removed", func(m *Manifest) { delete(m.DefaultPermissions, "workflows") }},
+		{"a write narrowed to read", func(m *Manifest) { m.DefaultPermissions["contents"] = "read" }},
+		{"the App made public", func(m *Manifest) { m.Public = true }},
+	} {
+		candidate := approvedManifest(redirect)
+		candidate.DefaultPermissions = maps.Clone(candidate.DefaultPermissions)
+		drift.mutate(&candidate)
+		if err := validateManifest(candidate); err == nil {
+			t.Fatalf("validateManifest accepted %s — the contract check is not defending the manifest, and no digest will catch drift authored INTO approvedManifest", drift.name)
+		}
+	}
+}
+
 func TestValidateManifestPacketRejectsAnyAuthorityDrift(t *testing.T) {
 	t.Parallel()
 	packet, err := PrepareManifestPacket("https://app.gitoversight.com/bootstrap/github-app/callback", bytes.NewReader(bytes.Repeat([]byte{3}, 64)))
@@ -98,7 +161,13 @@ func TestValidateManifestPacketRejectsAnyAuthorityDrift(t *testing.T) {
 		func(p *ManifestPacket) { p.State = p.State + "x" },
 		func(p *ManifestPacket) { p.Manifest.Name = "Different App" },
 		func(p *ManifestPacket) { p.Manifest.Public = true },
-		func(p *ManifestPacket) { p.Manifest.DefaultPermissions["workflows"] = "write" },
+		// Any permission outside the approved set is drift. `workflows` was the
+		// mutation here until 2026-07-27, when it was ADDED to the contract —
+		// withholding it blocked CI writes on an agent's own private repository
+		// while buying no boundary, since public publication is gated on human
+		// approval one layer up. `members` stands in as a permission the App has
+		// no business holding, so the drift assertion keeps its teeth.
+		func(p *ManifestPacket) { p.Manifest.DefaultPermissions["members"] = "write" },
 		func(p *ManifestPacket) {
 			p.Manifest.CallbackURLs = append(p.Manifest.CallbackURLs, "https://example.com")
 		},
@@ -136,7 +205,7 @@ func TestRenderRegistrationHTMLContainsOnlyExactManifestAndState(t *testing.T) {
 			t.Fatalf("HTML missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"agent-zara", "Zara", "client_secret", "webhook_secret", "PRIVATE KEY"} {
+	for _, forbidden := range []string{"private-agent-id", "Private Agent", "client_secret", "webhook_secret", "PRIVATE KEY"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("HTML contains forbidden %q", forbidden)
 		}

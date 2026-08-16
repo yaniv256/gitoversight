@@ -14,6 +14,59 @@ import (
 	"github.com/yaniv256/gitoversight.dev/internal/commitpacket"
 )
 
+func TestPolicyPromoteCommandsSendSignedRequestsToTheirExactEndpoints(t *testing.T) {
+	identityPath := filepath.Join(t.TempDir(), "identity.key")
+	if _, err := generateIdentity(identityPath); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := os.ReadFile(filepath.Join("..", "..", "config", "policy.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotPath := filepath.Join(t.TempDir(), "policy.json")
+	if err := os.WriteFile(snapshotPath, snapshot, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var gotPath string
+	var got map[string]any
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		if request.Header.Get("Signature") == "" {
+			t.Error("request was not signed")
+		}
+		if err := json.NewDecoder(request.Body).Decode(&got); err != nil {
+			t.Error(err)
+		}
+		response.WriteHeader(http.StatusCreated)
+		_, _ = response.Write([]byte(`{"generation":2,"policy_hash":"next"}`))
+	}))
+	defer server.Close()
+
+	for _, test := range []struct{ command, path string }{
+		{"policy-promote", "/v1/policy/orchestrator"},
+		{"policy-promote-private-owners", "/v1/policy/private-owner-additions"},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			gotPath, got = "", nil
+			args := []string{
+				test.command, "-url", server.URL, "-identity", identityPath,
+				"-tenant", "tenant-a", "-agent", "zara", "-credential", "zara-1",
+				"-snapshot-file", snapshotPath, "-expected-generation", "1", "-expected-policy-hash", "previous",
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(args, &stdout, &stderr, server.Client()); code != 0 {
+				t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+			}
+			if gotPath != test.path {
+				t.Fatalf("path = %q", gotPath)
+			}
+			if got["tenant_id"] != "tenant-a" || got["expected_policy_hash"] != "previous" {
+				t.Fatalf("payload = %#v", got)
+			}
+		})
+	}
+}
+
 func TestBuildCommitPacketReproducesLocalObjectIdentities(t *testing.T) {
 	repository := t.TempDir()
 	commands := [][]string{

@@ -85,12 +85,25 @@ func (w *Worker) Reconcile(request Request, now time.Time) (Result, error) {
 }
 
 type Result struct {
-	ResourceID    string `json:"resource_id,omitempty"`
-	Indeterminate bool   `json:"indeterminate,omitempty"`
+	ResourceID    string               `json:"resource_id,omitempty"`
+	Indeterminate bool                 `json:"indeterminate,omitempty"`
+	AssetWitness  *ReleaseAssetWitness `json:"asset_witness,omitempty"`
 	// Detail carries a human-readable reason when an operation did not land as
 	// intended — e.g. the GitHub refusal message behind an `absent` state. It is
 	// diagnostic only; it never changes the authorization outcome or state.
 	Detail string `json:"detail,omitempty"`
+}
+
+// ReleaseAssetWitness is GitHub's bounded response evidence. It contains only
+// metadata and is safe to persist in RPC results and receipts.
+type ReleaseAssetWitness struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"content_type,omitempty"`
+	State       string `json:"state,omitempty"`
+	Digest      string `json:"digest,omitempty"`
+	ResourceID  string `json:"resource_id,omitempty"`
 }
 
 type Worker struct {

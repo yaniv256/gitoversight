@@ -92,7 +92,6 @@ type HumanSession struct {
 	CSRFHash        string
 	CreatedAt       time.Time
 	AuthenticatedAt *time.Time
-	RecentAuthUntil *time.Time
 	ExpiresAt       time.Time
 	RevokedAt       *time.Time
 }
@@ -176,4 +175,59 @@ type WebhookReceipt struct {
 	EventType  string
 	BodyHash   string
 	ReceivedAt time.Time
+}
+
+type StagedAssetState string
+
+const (
+	StagedAssetCreated    StagedAssetState = "created"
+	StagedAssetUploading  StagedAssetState = "uploading"
+	StagedAssetReady      StagedAssetState = "ready"
+	StagedAssetPinned     StagedAssetState = "pinned"
+	StagedAssetAbandoned  StagedAssetState = "abandoned"
+	StagedAssetExpired    StagedAssetState = "expired"
+	StagedAssetReleasable StagedAssetState = "releasable"
+)
+
+// StagedAsset contains metadata only. Release bytes are held by the immutable
+// filesystem store and are never serialized into SQLite.
+type StagedAsset struct {
+	TenantID            string
+	ID                  string
+	AgentID             string
+	CredentialID        string
+	Repository          string
+	Name                string
+	ContentType         string
+	ExpectedSHA256      string
+	ExpectedSize        int64
+	ReservedSize        int64
+	State               StagedAssetState
+	CapabilityHash      string
+	CapabilityExpiresAt time.Time
+	CapabilityUsedAt    *time.Time
+	TempID              string
+	ObjectKey           string
+	OperationID         string
+	CleanupClaimedAt    *time.Time
+	CleanupAttempts     int
+	CleanupError        string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	ExpiresAt           time.Time
+}
+
+type StagedAssetCleanup struct {
+	TenantID       string
+	StageID        string
+	ObjectKey      string
+	ExpectedSize   int64
+	ExpectedSHA256 string
+	Attempts       int
+}
+
+type StagedAssetBackupObject struct {
+	Key    string
+	Size   int64
+	SHA256 string
 }

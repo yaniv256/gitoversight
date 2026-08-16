@@ -114,6 +114,29 @@ type Signature struct {
 	Date  string `json:"date"`
 }
 
+// NewDelta constructs and validates a parent-relative commit packet from
+// broker-derived Git objects. It is the server-side counterpart to the CLI's
+// local Git packet builder and prevents protocol adapters from carrying a
+// complete repository packet through a model context.
+func NewDelta(baseCommit, baseTree, resultTree, message string, signature Signature, entries []TreeEntry, blobs []Blob) (Packet, error) {
+	packet := Packet{
+		Blobs:  append([]Blob(nil), blobs...),
+		Tree:   Tree{SHA: resultTree, BaseTree: baseTree, Entries: append([]TreeEntry(nil), entries...)},
+		Commit: Commit{Message: message, Tree: resultTree, Parents: []string{baseCommit}, Author: signature, Committer: signature},
+	}
+	packet.Commit.SHA = gitCommitSHA(packet.Commit)
+	if err := packet.Validate(); err != nil {
+		return Packet{}, err
+	}
+	return packet, nil
+}
+
+// BlobFromBytes returns the immutable Git blob representation used by a delta
+// packet. Callers never choose or assert the object identity.
+func BlobFromBytes(content []byte) Blob {
+	return Blob{SHA: gitBlobSHA(content), Content: base64.StdEncoding.EncodeToString(content), Encoding: "base64"}
+}
+
 func Decode(payload map[string]any) (Packet, bool, error) {
 	raw, exists := payload["object_package"]
 	if !exists {

@@ -1,0 +1,24 @@
+{{define "diff"}}
+{{with .File}}
+{{if .Binary}}
+<p class="muted diffnote">Binary file — not shown as text.</p>
+{{else if eq (printf "%s" .Kind) "submodule"}}
+<p class="muted diffnote">Submodule pointer moves from <code>{{.OldSHA}}</code> to <code>{{.NewSHA}}</code>.</p>
+{{else if .Truncated}}
+{{if .CountsUnavailable}}
+<p class="muted diffnote">This diff is too large to compute safely in the review page. The file is still part of this change and was scanned for private identifiers.</p>
+{{else}}
+<p class="muted diffnote">This diff is too large to display ({{.Added}} added, {{.Removed}} removed). The file is still part of this change and was scanned for private identifiers.</p>
+{{end}}
+{{else}}
+{{range .Hunks}}
+<div class="diff">
+  <div class="hunk">{{.Header}}</div>
+  {{range .Lines}}<div class="dl {{lineClass .Op}}">{{printf "%c" .Op}}{{.Text}}</div>{{end}}
+</div>
+{{else}}
+<p class="muted diffnote">Only file metadata changed; content is unchanged.</p>
+{{end}}
+{{end}}
+{{end}}
+{{end}}

@@ -143,6 +143,11 @@ func (db *DB) FinalizeIndeterminateReconciliation(ctx context.Context, tenantID,
 		if err := requireOneRow(result, "indeterminate operation"); err != nil {
 			return err
 		}
+		if outcome == "verified" {
+			if err := registerDerivedRepository(ctx, tx.tx, tenantID, operationID, finalizedAt); err != nil {
+				return err
+			}
+		}
 		if outcome == "verified" && grant.ApprovalID != "" {
 			// No expires_at check here: the approval already authorized the
 			// execution inside its window (the grant is consumed), and GitHub has
@@ -259,6 +264,11 @@ func (db *DB) FinalizeExecutionGrant(ctx context.Context, tokenHash, outcome, re
 		}
 		if err := requireOneRow(result, "executing operation"); err != nil {
 			return err
+		}
+		if outcome == "verified" {
+			if err := registerDerivedRepository(ctx, tx.tx, grant.TenantID, grant.OperationID, finalizedAt); err != nil {
+				return err
+			}
 		}
 		if outcome == "verified" && grant.ApprovalID != "" {
 			approvalResult, err := tx.tx.ExecContext(ctx, `UPDATE approvals SET consumed_at = ? WHERE tenant_id = ? AND id = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?`, unix(finalizedAt), grant.TenantID, grant.ApprovalID, unix(finalizedAt))

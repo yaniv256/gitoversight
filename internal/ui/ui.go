@@ -16,6 +16,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/yaniv256/gitoversight.dev/internal/attribution"
 	"github.com/yaniv256/gitoversight.dev/internal/githubapp"
 	"github.com/yaniv256/gitoversight.dev/internal/policy"
+	"github.com/yaniv256/gitoversight.dev/internal/prpreview"
 	"github.com/yaniv256/gitoversight.dev/internal/searchembed"
 	"github.com/yaniv256/gitoversight.dev/internal/searchstore"
 	"github.com/yaniv256/gitoversight.dev/internal/storage"
@@ -67,6 +69,7 @@ type Handler struct {
 	policy             policy.Snapshot
 	proposedPolicyPath string
 	pages              map[string]*template.Template
+	diffPage           *template.Template
 	logf               func(format string, args ...any)
 
 	// searchConfigured records whether Config.SearchDBPath was set; when it
@@ -132,6 +135,10 @@ func NewHandler(config Config) (*Handler, error) {
 		}
 		pages[name] = parsed
 	}
+	diffPage, err := template.New("diff.html").Funcs(funcs).ParseFS(templateFS, "templates/diff.html")
+	if err != nil {
+		return nil, err
+	}
 	logf := config.Logf
 	if logf == nil {
 		logf = log.Printf
@@ -139,7 +146,7 @@ func NewHandler(config Config) (*Handler, error) {
 	return &Handler{store: config.Store, policy: config.Policy, proposedPolicyPath: config.ProposedPolicyPath,
 		searchConfigured: config.SearchDBPath != "", searchReader: searchstore.NewLazyReader(config.SearchDBPath),
 		bases: config.Bases, baseBranch: baseBranch, privateIdentities: config.PrivateIdentities,
-		logf: logf, pages: pages}, nil
+		logf: logf, pages: pages, diffPage: diffPage}, nil
 }
 
 // pageCSP deliberately overwrites the router-wide lockdown CSP (KTD6): the
@@ -172,6 +179,7 @@ type pageData struct {
 	IndexBuilding bool
 	SearchError   bool
 	LastSync      string
+	File          prpreview.FileDiff
 }
 
 type repoView struct {
@@ -243,13 +251,33 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	}
 	approver, ok := api.HumanApproverFromContext(request.Context())
 	if !ok {
-		http.Redirect(response, request, "/login/github", http.StatusFound)
+		// Login is an interruption, not the reviewer's destination. Preserve the
+		// exact same-site UI route across the OAuth round-trip; otherwise a direct
+		// review link silently degrades into the generic queue page.
+		returnTo := request.URL.RequestURI()
+		if returnTo == "" {
+			returnTo = "/ui/now"
+		}
+		http.Redirect(response, request, "/login/github?return_to="+url.QueryEscape(returnTo), http.StatusFound)
 		return
 	}
-	csrf := ""
-	if cookie, err := request.Cookie("gitoversight_csrf"); err == nil {
-		csrf = cookie.Value
+	// Every action on these pages needs this token, so rendering without it
+	// produces a page whose buttons are dead on arrival: the POST carries an
+	// empty X-CSRF-Token, the API answers 403, and the client — which cannot
+	// tell that apart from a lapsed step-up — tells the reviewer to sign in
+	// again. Signing in does not help, so the reviewer loops.
+	//
+	// That happened live (2026-07-27) when only the session cookie was Lax:
+	// the reviewer arrived from GitHub with a session but no CSRF cookie, and
+	// the page rendered an empty token in silence. Both cookies are Lax now,
+	// but a page that cannot act must SAY so rather than render a control that
+	// cannot work — the failure has to be visible where the action is.
+	cookie, err := request.Cookie("gitoversight_csrf")
+	if err != nil || cookie.Value == "" {
+		http.Redirect(response, request, "/login/github?return_to="+url.QueryEscape("/"+path), http.StatusFound)
+		return
 	}
+	csrf := cookie.Value
 	if strings.HasPrefix(path, "ui/approval/") {
 		id := strings.TrimPrefix(path, "ui/approval/")
 		if id == "" || strings.Contains(id, "/") {
@@ -279,7 +307,17 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		return
 	}
 	if strings.HasPrefix(path, "ui/sync/") {
-		id := strings.TrimPrefix(path, "ui/sync/")
+		remainder := strings.TrimPrefix(path, "ui/sync/")
+		if strings.HasSuffix(remainder, "/diff") {
+			id := strings.TrimSuffix(remainder, "/diff")
+			if id == "" || strings.Contains(id, "/") {
+				http.NotFound(response, request)
+				return
+			}
+			handler.serveSyncDiff(response, request, approver.TenantID, id)
+			return
+		}
+		id := remainder
 		if id == "" || strings.Contains(id, "/") {
 			http.NotFound(response, request)
 			return
@@ -289,7 +327,15 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 			http.NotFound(response, request)
 			return
 		}
-		view := buildSyncView(sync, handler.baseContentFor(request.Context(), sync), handler.privateIdentities)
+		// The diff is part of the authorization surface, so it is needed only
+		// while the proposal is awaiting review. Rebuilding it after the public
+		// PR already exists performs hundreds of worker RPC blob reads for data
+		// the template does not render; sufficiently large historical syncs can
+		// therefore time out before showing the one link the reviewer needs.
+		var view syncView
+		if sync.State == "proposed" {
+			view = handler.buildSyncView(sync, handler.privateIdentities)
+		}
 		// Provenance is best-effort: a reviewer who cannot see the revision
 		// history is worse off than one who can, but not as badly off as one
 		// who cannot see the proposal at all. An audit-read failure must not
@@ -332,6 +378,50 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		handler.render(response, "now", data)
 	default:
 		http.NotFound(response, request)
+	}
+}
+
+func (handler *Handler) serveSyncDiff(response http.ResponseWriter, request *http.Request, tenantID, id string) {
+	sync, err := handler.store.GetSyncRequest(request.Context(), tenantID, id)
+	if err != nil || sync.State != "proposed" || handler.bases == nil {
+		http.NotFound(response, request)
+		return
+	}
+	packet, unavailable := decodeSyncPacket(sync)
+	if unavailable != "" {
+		http.Error(response, unavailable, http.StatusUnprocessableEntity)
+		return
+	}
+	base, err := handler.bases.ReadBase(workerrpc.BaseReadRequest{Repository: sync.PublicRepository, Branch: handler.baseBranch})
+	if err != nil {
+		http.Error(response, "The public repository could not be read.", http.StatusServiceUnavailable)
+		return
+	}
+	if packet.Tree.BaseTree != "" && base.TreeSHA != packet.Tree.BaseTree {
+		http.Error(response, "The public base moved after this proposal was created. Reload the review before authorizing.", http.StatusConflict)
+		return
+	}
+	entries := make(map[string]prpreview.BaseEntry, len(base.Entries))
+	for _, entry := range base.Entries {
+		entries[entry.Path] = prpreview.BaseEntry{SHA: entry.SHA, Mode: entry.Mode, Type: entry.Type}
+	}
+	baseContent := func(path string) ([]byte, bool, error) {
+		entry, present := entries[path]
+		if !present {
+			return nil, false, nil
+		}
+		content, err := handler.bases.ReadBlob(sync.PublicRepository, entry.SHA)
+		return content, true, err
+	}
+	file, err := prpreview.BuildFile(packet, request.URL.Query().Get("path"), baseContent, entries)
+	if err != nil {
+		http.Error(response, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	response.Header().Set("Content-Type", "text/html; charset=utf-8")
+	response.Header().Set("Cache-Control", "private, no-store")
+	if err := handler.diffPage.ExecuteTemplate(response, "diff", pageData{File: file}); err != nil {
+		http.Error(response, "render failed", http.StatusInternalServerError)
 	}
 }
 

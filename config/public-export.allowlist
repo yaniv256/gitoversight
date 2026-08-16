@@ -1,0 +1,20 @@
+# Current public product source. Entries are repository-relative files or trees.
+.github/workflows/ci.yml
+CONCEPTS.md
+CONTRIBUTING.md
+LICENSE
+README.md
+SECURITY.md
+SKILL.md
+go.mod
+go.sum
+cmd
+config
+internal
+plugins/gitoversight/.codex-plugin/plugin.json
+plugins/gitoversight/.mcp.json
+plugins/gitoversight/skills
+scripts/export-public.sh
+tests/contract
+tests/live
+tests/security

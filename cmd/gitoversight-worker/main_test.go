@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,12 +12,65 @@ import (
 
 	"github.com/yaniv256/gitoversight.dev/internal/githubapp"
 	"github.com/yaniv256/gitoversight.dev/internal/oauthflow"
+	"github.com/yaniv256/gitoversight.dev/internal/policy"
 	"github.com/yaniv256/gitoversight.dev/internal/searchstore"
 	"github.com/yaniv256/gitoversight.dev/internal/workerrpc"
 )
 
 type oauthCoordinatorStub struct {
 	begin oauthflow.BeginRequest
+}
+
+type tokenProviderStub struct {
+	want, token string
+	calls       int
+}
+
+func (stub *tokenProviderStub) Token(subject string) (string, error) {
+	stub.calls++
+	if subject != stub.want {
+		return "", errors.New("unexpected token subject")
+	}
+	return stub.token, nil
+}
+
+type repositoryAuthorityStub struct {
+	repository policy.Repository
+	found      bool
+}
+
+func (stub repositoryAuthorityStub) ResolveRepository(string, time.Time) (policy.Repository, bool, error) {
+	return stub.repository, stub.found, nil
+}
+
+func TestDerivedRepositoryReadUsesCreatorHumanToken(t *testing.T) {
+	installation := &tokenProviderStub{want: "owner/repo\x00repository.read", token: "installation"}
+	human := &tokenProviderStub{want: "yaniv", token: "human"}
+	minter := derivedRepositoryReadMinter{
+		installations: installation,
+		humans:        human,
+		authority: repositoryAuthorityStub{found: true, repository: policy.Repository{
+			Visibility: "private", Derived: true, ActorSubject: "yaniv",
+		}},
+	}
+	token, err := minter.Token("owner/repo\x00repository.read")
+	if err != nil || token != "human" || human.calls != 1 || installation.calls != 0 {
+		t.Fatalf("token=%q err=%v human_calls=%d installation_calls=%d", token, err, human.calls, installation.calls)
+	}
+}
+
+func TestConfiguredRepositoryReadKeepsInstallationToken(t *testing.T) {
+	installation := &tokenProviderStub{want: "owner/repo\x00repository.read", token: "installation"}
+	human := &tokenProviderStub{want: "", token: "human"}
+	minter := derivedRepositoryReadMinter{
+		installations: installation,
+		humans:        human,
+		authority:     repositoryAuthorityStub{found: true, repository: policy.Repository{Visibility: "private"}},
+	}
+	token, err := minter.Token("owner/repo\x00repository.read")
+	if err != nil || token != "installation" || installation.calls != 1 || human.calls != 0 {
+		t.Fatalf("token=%q err=%v human_calls=%d installation_calls=%d", token, err, human.calls, installation.calls)
+	}
 }
 
 func (stub *oauthCoordinatorStub) Begin(request oauthflow.BeginRequest) (string, error) {

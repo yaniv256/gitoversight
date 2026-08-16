@@ -1,6 +1,8 @@
 package githubapp_test
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -9,13 +11,204 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/githubapp"
+	"github.com/yaniv256/gitoversight.dev/internal/releaseasset"
 	"github.com/yaniv256/gitoversight.dev/internal/worker"
 )
+
+func TestStreamedReleaseAssetUploadsSixteenMiBWithBoundedDescriptorAndWitness(t *testing.T) {
+	const size = 16 << 20
+	content := bytes.Repeat([]byte("stream-without-model-bytes"), size/len("stream-without-model-bytes")+1)[:size]
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	files, err := releaseasset.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := files.Publish(context.Background(), "tenant-a", "stage-a", size, digest, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/releases/tags/"):
+			fmt.Fprintf(response, `{"id":5,"upload_url":%q}`, server.URL+"/uploads{?name,label}")
+		case request.Method == http.MethodPost && request.URL.Path == "/uploads":
+			if request.ContentLength != size {
+				t.Fatalf("content length = %d", request.ContentLength)
+			}
+			hash := sha256.New()
+			count, copyErr := io.Copy(hash, request.Body)
+			if copyErr != nil || count != size || fmt.Sprintf("%x", hash.Sum(nil)) != digest {
+				t.Fatalf("stream = %d bytes, digest %x, err %v", count, hash.Sum(nil), copyErr)
+			}
+			fmt.Fprintf(response, `{"id":7,"name":"bridge.zip","size":%d,"content_type":"application/octet-stream","state":"uploaded","digest":"sha256:%s","url":%q}`, size, digest, server.URL+"/assets/7")
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+		}
+	}))
+	defer server.Close()
+	client := operationClient(t, server, "private")
+	executor := githubapp.NewExecutorWithBlobReader(client, files)
+	result, err := executor.Execute(worker.Request{
+		TenantID: "tenant-a", Repository: "yaniv256/private", Operation: "release.asset.upload",
+		ActorMode: string(githubapp.AppInstallation),
+		Payload: map[string]any{
+			"tag_name": "v1", "name": "bridge.zip", "content_type": "application/zip",
+			"asset": map[string]any{"stage_id": "stage-a", "sha256": digest, "size": float64(size)},
+		},
+	})
+	if err != nil || result.ResourceID != server.URL+"/assets/7" {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	if result.AssetWitness == nil || result.AssetWitness.Digest != "sha256:"+digest ||
+		result.AssetWitness.State != "uploaded" || result.AssetWitness.Size != size {
+		t.Fatalf("witness = %#v", result.AssetWitness)
+	}
+}
+
+func TestStreamedReleaseAssetBundleUploadsAllDescriptorsUnderOneOperation(t *testing.T) {
+	files, err := releaseasset.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := [][]byte{[]byte("linux"), []byte("mac")}
+	names := []string{"linux.tar.gz", "mac.tar.gz"}
+	stages := []string{"stage-linux", "stage-mac"}
+	digests := make([]string, len(contents))
+	for index := range contents {
+		digests[index] = fmt.Sprintf("%x", sha256.Sum256(contents[index]))
+		if _, err := files.Publish(context.Background(), "tenant-a", stages[index], int64(len(contents[index])), digests[index], bytes.NewReader(contents[index])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	uploads := map[string]string{}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/releases/tags/"):
+			fmt.Fprintf(response, `{"id":5,"upload_url":%q}`, server.URL+"/uploads{?name,label}")
+		case request.Method == http.MethodPost && request.URL.Path == "/uploads":
+			content, readErr := io.ReadAll(request.Body)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			name := request.URL.Query().Get("name")
+			digest := fmt.Sprintf("%x", sha256.Sum256(content))
+			uploads[name] = digest
+			fmt.Fprintf(response, `{"id":%d,"name":%q,"size":%d,"content_type":"application/gzip","state":"uploaded","digest":"sha256:%s","url":%q}`, len(uploads), name, len(content), digest, server.URL+"/assets/"+name)
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+		}
+	}))
+	defer server.Close()
+	assets := make([]any, 0, len(contents))
+	for index := range contents {
+		assets = append(assets, map[string]any{
+			"tag_name": "v1", "name": names[index], "content_type": "application/gzip",
+			"asset": map[string]any{"stage_id": stages[index], "sha256": digests[index], "size": float64(len(contents[index]))},
+		})
+	}
+	executor := githubapp.NewExecutorWithBlobReader(operationClient(t, server, "private"), files)
+	_, err = executor.Execute(worker.Request{
+		TenantID: "tenant-a", Repository: "yaniv256/private", Operation: "release.assets.upload",
+		ActorMode: string(githubapp.AppInstallation), Payload: map[string]any{"assets": assets},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, name := range names {
+		if uploads[name] != digests[index] {
+			t.Fatalf("upload %s digest = %q, want %q", name, uploads[name], digests[index])
+		}
+	}
+}
+
+func TestStreamedReleaseAssetCorruptionSendsZeroGitHubRequests(t *testing.T) {
+	content := []byte("approved")
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	root := t.TempDir()
+	files, err := releaseasset.NewFileStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := files.Publish(context.Background(), "tenant-a", "stage-a", int64(len(content)), digest, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	var objectPath string
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			objectPath = path
+		}
+		return err
+	}); err != nil || objectPath == "" {
+		t.Fatalf("locate object: %v", err)
+	}
+	if err := os.Chmod(objectPath, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(objectPath, []byte("corrupt!"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	executor := githubapp.NewExecutorWithBlobReader(operationClient(t, server, "private"), files)
+	_, err = executor.Execute(worker.Request{
+		TenantID: "tenant-a", Repository: "yaniv256/private", Operation: "release.asset.upload",
+		ActorMode: string(githubapp.AppInstallation),
+		Payload: map[string]any{
+			"tag_name": "v1", "name": "bridge.zip", "content_type": "application/zip",
+			"asset": map[string]any{"stage_id": "stage-a", "sha256": digest, "size": float64(len(content))},
+		},
+	})
+	if err == nil || requests != 0 {
+		t.Fatalf("err = %v, github requests = %d", err, requests)
+	}
+}
+
+func TestReleaseAssetReconciliationRedirectNeverForwardsAuthorization(t *testing.T) {
+	content := []byte("remote-only")
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	var leaked string
+	download := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		leaked = request.Header.Get("Authorization")
+		response.Write(content)
+	}))
+	defer download.Close()
+	var api *httptest.Server
+	api = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/yaniv256/private/releases/tags/v1":
+			io.WriteString(response, `{"id":5}`)
+		case "/repos/yaniv256/private/releases/5/assets":
+			fmt.Fprintf(response, `[{"id":7,"name":"bridge.zip","size":%d,"content_type":"application/octet-stream","state":"uploaded","url":%q}]`, len(content), api.URL+"/assets/7")
+		case "/assets/7":
+			http.Redirect(response, request, download.URL+"/object", http.StatusFound)
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+		}
+	}))
+	defer api.Close()
+	result, err := operationClient(t, api, "private").ReconcileMutation(worker.Request{
+		Repository: "yaniv256/private", Operation: "release.asset.upload",
+		Payload: map[string]any{
+			"tag_name": "v1", "name": "bridge.zip", "content_type": "application/zip",
+			"asset": map[string]any{"stage_id": "stage-gone", "sha256": digest, "size": float64(len(content))},
+		},
+	}, githubapp.AppInstallation, "")
+	if err != nil || result.State != worker.ReconciliationCommitted {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	if leaked != "" {
+		t.Fatalf("authorization leaked across redirect: %q", leaked)
+	}
+}
 
 func TestBranchPushAmbiguousObjectCreationNeverUpdatesRefAndReconcilesAbsent(t *testing.T) {
 	const treeSHA = "1111111111111111111111111111111111111111"
@@ -78,6 +271,8 @@ func TestBranchPushPublishesImmutableGitObjectsBeforeUpdatingRef(t *testing.T) {
 		},
 	}}
 	want := []struct{ method, path, sha string }{
+		{http.MethodGet, "/repos/yaniv256/private/git/commits/" + parentSHA, parentSHA},
+		{http.MethodGet, "/repos/yaniv256/private/git/trees/2222222222222222222222222222222222222222", "2222222222222222222222222222222222222222"},
 		{http.MethodPost, "/repos/yaniv256/private/git/blobs", blobSHA},
 		{http.MethodPost, "/repos/yaniv256/private/git/trees", treeSHA},
 		{http.MethodPost, "/repos/yaniv256/private/git/commits", commitSHA},
@@ -96,25 +291,25 @@ func TestBranchPushPublishesImmutableGitObjectsBeforeUpdatingRef(t *testing.T) {
 			}
 		}
 		switch calls {
-		case 0:
+		case 2:
 			if body["content"] != "" || body["encoding"] != "base64" {
 				t.Fatalf("blob body = %#v", body)
 			}
-		case 1:
+		case 3:
 			entries, ok := body["tree"].([]any)
 			if !ok || body["base_tree"] != "2222222222222222222222222222222222222222" || len(entries) != 2 || entries[0].(map[string]any)["path"] != "empty.txt" || entries[1].(map[string]any)["path"] != "removed.txt" || entries[1].(map[string]any)["sha"] != nil {
 				t.Fatalf("tree body = %#v", body)
 			}
-		case 2:
+		case 4:
 			parents, ok := body["parents"].([]any)
 			if !ok || len(parents) != 1 || parents[0] != parentSHA || body["tree"] != treeSHA {
 				t.Fatalf("commit body = %#v", body)
 			}
-		case 3:
+		case 5:
 			io.WriteString(response, `{"ref":"refs/heads/agent/zara/new","object":{"sha":"`+commitSHA+`"}}`)
 			calls++
 			return
-		case 4:
+		case 6:
 			if body["sha"] != commitSHA || body["force"] != false {
 				t.Fatalf("ref body = %#v", body)
 			}
@@ -131,6 +326,59 @@ func TestBranchPushPublishesImmutableGitObjectsBeforeUpdatingRef(t *testing.T) {
 	resource, err := client.ExecuteMutation(request, githubapp.AppInstallation, "")
 	if err != nil || resource != "refs/heads/agent/zara/new" || calls != len(want) {
 		t.Fatalf("resource = %q, calls = %d, err = %v", resource, calls, err)
+	}
+}
+
+func TestBranchPushRejectsMissingParentBeforeUploadingBlobs(t *testing.T) {
+	request := emptyRepoPushRequest()
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, got *http.Request) {
+		calls++
+		if got.Method != http.MethodGet || got.URL.EscapedPath() != "/repos/yaniv256/brand-new/git/commits/3333333333333333333333333333333333333333" {
+			t.Fatalf("call = %s %s", got.Method, got.URL.EscapedPath())
+		}
+		http.NotFound(response, got)
+	}))
+	defer server.Close()
+	client := operationClient(t, server, "private")
+	_, err := client.ExecuteMutation(request, githubapp.AppInstallation, "")
+	if err == nil || !strings.Contains(err.Error(), "publish that parent first") {
+		t.Fatalf("error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want one preflight read and no uploads", calls)
+	}
+}
+
+func TestBranchPushRejectsMissingBaseTreeBeforeUploadingBlobs(t *testing.T) {
+	request := emptyRepoPushRequest()
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, got *http.Request) {
+		calls++
+		if got.Method != http.MethodGet {
+			t.Fatalf("call = %s %s", got.Method, got.URL.EscapedPath())
+		}
+		switch calls {
+		case 1:
+			if got.URL.EscapedPath() != "/repos/yaniv256/brand-new/git/commits/3333333333333333333333333333333333333333" {
+				t.Fatalf("parent read = %s", got.URL.EscapedPath())
+			}
+			io.WriteString(response, `{"sha":"3333333333333333333333333333333333333333"}`)
+		case 2:
+			if got.URL.EscapedPath() != "/repos/yaniv256/brand-new/git/trees/2222222222222222222222222222222222222222" {
+				t.Fatalf("tree read = %s", got.URL.EscapedPath())
+			}
+			http.NotFound(response, got)
+		}
+	}))
+	defer server.Close()
+	client := operationClient(t, server, "private")
+	_, err := client.ExecuteMutation(request, githubapp.AppInstallation, "")
+	if err == nil || !strings.Contains(err.Error(), "build a complete tree") {
+		t.Fatalf("error = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want two preflight reads and no uploads", calls)
 	}
 }
 
@@ -215,8 +463,8 @@ func TestBranchPushBootstrapsEmptyRepositoryViaContentsAPI(t *testing.T) {
 		calls++
 		path := got.URL.EscapedPath()
 		switch calls {
-		case 1: // first blob upload hits the disabled git-data API
-			if got.Method != http.MethodPost || path != "/repos/yaniv256/brand-new/git/blobs" {
+		case 1: // prerequisite read detects the disabled git-data API
+			if got.Method != http.MethodGet || path != "/repos/yaniv256/brand-new/git/commits/3333333333333333333333333333333333333333" {
 				t.Fatalf("call 1 = %s %s", got.Method, path)
 			}
 			emptyRepo409(response)
@@ -232,29 +480,38 @@ func TestBranchPushBootstrapsEmptyRepositoryViaContentsAPI(t *testing.T) {
 				t.Fatalf("bootstrap body = %#v", body)
 			}
 			io.WriteString(response, `{"content":{},"commit":{"sha":"`+bootSHA+`"}}`)
-		case 3:
-			if path != "/repos/yaniv256/brand-new/git/blobs" {
+		case 3: // bootstrap is acknowledged before git-data sees it
+			if path != "/repos/yaniv256/brand-new/git/commits/3333333333333333333333333333333333333333" {
 				t.Fatalf("call 3 = %s %s", got.Method, path)
 			}
-			io.WriteString(response, `{"sha":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"}`)
+			emptyRepo409(response)
 		case 4:
-			if path != "/repos/yaniv256/brand-new/git/trees" {
+			io.WriteString(response, `{"sha":"3333333333333333333333333333333333333333"}`)
+		case 5:
+			io.WriteString(response, `{"sha":"2222222222222222222222222222222222222222"}`)
+		case 6:
+			if path != "/repos/yaniv256/brand-new/git/blobs" {
 				t.Fatalf("call 4 = %s %s", got.Method, path)
 			}
-			io.WriteString(response, `{"sha":"1111111111111111111111111111111111111111"}`)
-		case 5:
-			if path != "/repos/yaniv256/brand-new/git/commits" {
+			io.WriteString(response, `{"sha":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"}`)
+		case 7:
+			if path != "/repos/yaniv256/brand-new/git/trees" {
 				t.Fatalf("call 5 = %s %s", got.Method, path)
 			}
-			io.WriteString(response, `{"sha":"`+commitSHA+`"}`)
-		case 6: // precondition read: branch must still be at the bootstrap commit
-			if got.Method != http.MethodGet || path != "/repos/yaniv256/brand-new/git/refs/heads/main" {
+			io.WriteString(response, `{"sha":"1111111111111111111111111111111111111111"}`)
+		case 8:
+			if path != "/repos/yaniv256/brand-new/git/commits" {
 				t.Fatalf("call 6 = %s %s", got.Method, path)
 			}
-			io.WriteString(response, `{"ref":"refs/heads/main","object":{"sha":"`+bootSHA+`"}}`)
-		case 7: // force-move onto the packet's history
-			if got.Method != http.MethodPatch || path != "/repos/yaniv256/brand-new/git/refs/heads/main" {
+			io.WriteString(response, `{"sha":"`+commitSHA+`"}`)
+		case 9: // precondition read: branch must still be at the bootstrap commit
+			if got.Method != http.MethodGet || path != "/repos/yaniv256/brand-new/git/refs/heads/main" {
 				t.Fatalf("call 7 = %s %s", got.Method, path)
+			}
+			io.WriteString(response, `{"ref":"refs/heads/main","object":{"sha":"`+bootSHA+`"}}`)
+		case 10: // force-move onto the packet's history
+			if got.Method != http.MethodPatch || path != "/repos/yaniv256/brand-new/git/refs/heads/main" {
+				t.Fatalf("call 8 = %s %s", got.Method, path)
 			}
 			var body map[string]any
 			if err := json.NewDecoder(got.Body).Decode(&body); err != nil {
@@ -271,7 +528,7 @@ func TestBranchPushBootstrapsEmptyRepositoryViaContentsAPI(t *testing.T) {
 	defer server.Close()
 	client := operationClient(t, server, "private")
 	resource, err := client.ExecuteMutation(request, githubapp.AppInstallation, "")
-	if err != nil || resource != "refs/heads/main" || calls != 7 {
+	if err != nil || resource != "refs/heads/main" || calls != 10 {
 		t.Fatalf("resource = %q, calls = %d, err = %v", resource, calls, err)
 	}
 }
@@ -289,6 +546,10 @@ func TestBranchPushBootstrapRefusesForceMoveWhenBranchMoved(t *testing.T) {
 			emptyRepo409(response)
 		case calls == 2:
 			io.WriteString(response, `{"content":{},"commit":{"sha":"b007b007b007b007b007b007b007b007b007b007"}}`)
+		case path == "/repos/yaniv256/brand-new/git/commits/3333333333333333333333333333333333333333":
+			io.WriteString(response, `{"sha":"3333333333333333333333333333333333333333"}`)
+		case path == "/repos/yaniv256/brand-new/git/trees/2222222222222222222222222222222222222222":
+			io.WriteString(response, `{"sha":"2222222222222222222222222222222222222222"}`)
 		case path == "/repos/yaniv256/brand-new/git/blobs":
 			io.WriteString(response, `{"sha":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"}`)
 		case path == "/repos/yaniv256/brand-new/git/trees":
@@ -739,6 +1000,22 @@ func operationClient(t *testing.T, server *httptest.Server, visibility string) *
 	return client
 }
 
+func TestBranchPushReconcileTreatsEmptyRepositoryAsAbsent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.EscapedPath() != "/repos/yaniv256/new-private/git/refs/heads/main" {
+			t.Fatalf("request = %s %s", request.Method, request.URL.EscapedPath())
+		}
+		response.WriteHeader(http.StatusConflict)
+		io.WriteString(response, `{"message":"Git Repository is empty."}`)
+	}))
+	defer server.Close()
+	request := worker.Request{Repository: "yaniv256/new-private", Operation: "branch.push", Branch: "main", Payload: map[string]any{"sha": "e7d58d7556f49235e490e8c0b9e7ac655d0ab494"}}
+	result, err := operationClient(t, server, "private").ReconcileMutation(request, githubapp.HumanUser, "yaniv")
+	if err != nil || result.State != worker.ReconciliationAbsent {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
 // A root commit whose packet left parents nil must reach GitHub as [] — JSON
 // null draws a 422 'properties/parents, nil is not an array'.
 func TestPublishCommitObjectsSerializesNilParentsAsEmptyArray(t *testing.T) {
@@ -784,7 +1061,8 @@ func TestPublishCommitObjectsSerializesNilParentsAsEmptyArray(t *testing.T) {
 	}
 }
 func TestReleaseAssetUploadExecutesAndReconcilesExactBytes(t *testing.T) {
-	content := []byte("immutable release bytes")
+	content := bytes.Repeat([]byte("native-release-bytes"), (5<<20)/len("native-release-bytes")+1)
+	content = content[:5<<20]
 	digest := sha256.Sum256(content)
 	request := worker.Request{Repository: "yaniv256/private", Operation: "release.asset.upload", Payload: map[string]any{
 		"tag_name": "v1.0.0", "name": "runtime.zip", "content_type": "application/zip",
@@ -805,11 +1083,17 @@ func TestReleaseAssetUploadExecutesAndReconcilesExactBytes(t *testing.T) {
 				t.Fatalf("upload metadata = %s %q", got.URL.RawQuery, got.Header.Get("Content-Type"))
 			}
 			body, _ := io.ReadAll(got.Body)
-			if string(body) != string(content) {
-				t.Fatalf("upload body = %q", body)
+			if !bytes.Equal(body, content) {
+				t.Fatalf("upload body did not match %d approved bytes", len(content))
 			}
 			uploaded = true
 			fmt.Fprintf(response, `{"id":7,"name":"runtime.zip","size":%d,"url":%q,"browser_download_url":"https://github.test/runtime.zip"}`, len(content), server.URL+"/assets/7")
+		case got.Method == http.MethodGet && got.URL.EscapedPath() == "/repos/yaniv256/private/releases/5/assets":
+			if !uploaded {
+				io.WriteString(response, "[]")
+				return
+			}
+			fmt.Fprintf(response, `[{"id":7,"name":"runtime.zip","size":%d,"url":%q,"browser_download_url":"https://github.test/runtime.zip"}]`, len(content), server.URL+"/assets/7")
 		case got.Method == http.MethodGet && got.URL.EscapedPath() == "/assets/7":
 			if got.Header.Get("Accept") != "application/octet-stream" {
 				t.Fatalf("asset accept = %q", got.Header.Get("Accept"))

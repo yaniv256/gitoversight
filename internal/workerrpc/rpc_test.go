@@ -18,10 +18,12 @@ import (
 type runner struct {
 	calls int
 	fail  error
+	last  worker.Request
 }
 
 func (runner *runner) Handle(request worker.Request, _ time.Time) (worker.Result, error) {
 	runner.calls++
+	runner.last = request
 	if request.Capability == "" {
 		return worker.Result{}, errors.New("missing capability")
 	}
@@ -29,6 +31,37 @@ func (runner *runner) Handle(request worker.Request, _ time.Time) (worker.Result
 		return worker.Result{}, runner.fail
 	}
 	return worker.Result{ResourceID: "verified-private-pr-42"}, nil
+}
+
+func TestWorkerRPCCarriesOnlyReleaseAssetDescriptor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.sock")
+	run := &runner{}
+	service := workerrpc.NewServer(path, uint32(os.Getuid()), workerrpc.WithRunner(run))
+	listener, err := service.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go service.Serve(listener)
+	digest := strings.Repeat("a", 64)
+	_, err = workerrpc.NewClient(path).Run(worker.Request{
+		TenantID: "tenant-a", Capability: "capability", RequestID: "operation-a",
+		Repository: "yaniv256/private", Operation: "release.asset.upload",
+		Payload: map[string]any{
+			"tag_name": "v1", "name": "bridge.zip", "content_type": "application/zip",
+			"asset": map[string]any{"stage_id": "stage-a", "sha256": digest, "size": float64(16 << 20)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := run.last.Payload["content_base64"]; present {
+		t.Fatal("worker RPC carried release asset bytes")
+	}
+	asset, ok := run.last.Payload["asset"].(map[string]any)
+	if !ok || asset["stage_id"] != "stage-a" || asset["sha256"] != digest {
+		t.Fatalf("descriptor = %#v", run.last.Payload)
+	}
 }
 
 func TestPrivateWorkerRPCReportsSanitizedMutationFailureWithoutExposingItToClient(t *testing.T) {
@@ -129,6 +162,28 @@ func TestPrivateWorkerRPCExposesOnlyCapabilityGuardedMutationSurface(t *testing.
 	client := workerrpc.NewClient(path)
 	if err := client.Ping(); err != nil {
 		t.Fatalf("worker ping: %v", err)
+	}
+}
+
+func TestWorkerPingReportsReleaseAssetProtocolAndReadableRootWithoutPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.sock")
+	service := workerrpc.NewServer(path, uint32(os.Getuid()), workerrpc.WithReleaseAssetReadiness(func() workerrpc.ReleaseAssetReadiness {
+		return workerrpc.ReleaseAssetReadiness{
+			ProtocolVersion: 1, RootID: strings.Repeat("a", 64), Readable: true,
+		}
+	}))
+	listener, err := service.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go service.Serve(listener)
+	status, err := workerrpc.NewClient(path).PingStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.ProtocolVersion != 1 || status.RootID != strings.Repeat("a", 64) || !status.Readable {
+		t.Fatalf("ping status = %+v", status)
 	}
 }
 
@@ -303,6 +358,60 @@ type stubBaseReader struct {
 	base  workerrpc.BaseRead
 	blob  []byte
 	calls int
+}
+
+type stubSnapshotReader struct {
+	request workerrpc.RepositorySnapshotRequest
+	result  workerrpc.RepositorySnapshotRead
+}
+
+func (reader *stubSnapshotReader) ReadRepositoryBase(request workerrpc.RepositoryBaseRequest) (workerrpc.RepositoryBaseRead, error) {
+	return workerrpc.RepositoryBaseRead{Repository: request.Repository, Ref: request.Ref, CommitSHA: strings.Repeat("a", 40), TreeSHA: strings.Repeat("b", 40)}, nil
+}
+
+func (reader *stubSnapshotReader) ReadRepositorySnapshot(request workerrpc.RepositorySnapshotRequest) (workerrpc.RepositorySnapshotRead, error) {
+	reader.request = request
+	return reader.result, nil
+}
+
+func (reader *stubSnapshotReader) ReadRepositoryArchive(request workerrpc.RepositoryArchiveRequest) (workerrpc.RepositoryArchiveRead, error) {
+	return workerrpc.RepositoryArchiveRead{Repository: request.Repository, Ref: request.Ref, CommitSHA: request.ExactCommitSHA, TreeSHA: strings.Repeat("b", 40), ContentType: "application/gzip", SHA256: strings.Repeat("c", 64), Content: []byte("archive")}, nil
+}
+
+func TestPrivateWorkerRPCReadsExactBoundedRepositorySnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.sock")
+	reader := &stubSnapshotReader{result: workerrpc.RepositorySnapshotRead{Repository: "org/private", CommitSHA: strings.Repeat("a", 40), TreeSHA: strings.Repeat("b", 40)}}
+	service := workerrpc.NewServer(path, uint32(os.Getuid()), workerrpc.WithRepositorySnapshotReader(reader))
+	listener, err := service.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go service.Serve(listener)
+	request := workerrpc.RepositorySnapshotRequest{TenantID: "tenant", AgentID: "work", Repository: "org/private", Ref: "refs/heads/main", ExactCommitSHA: strings.Repeat("a", 40), MaxFiles: 10, MaxFileBytes: 1024, MaxTotalBytes: 4096}
+	result, err := workerrpc.NewClient(path).ReadRepositorySnapshot(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Repository != request.Repository || reader.request != request {
+		t.Fatalf("result/request = %#v / %#v", result, reader.request)
+	}
+}
+
+func TestPrivateWorkerRPCRejectsUnboundedRepositorySnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.sock")
+	reader := &stubSnapshotReader{}
+	service := workerrpc.NewServer(path, uint32(os.Getuid()), workerrpc.WithRepositorySnapshotReader(reader))
+	listener, err := service.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go service.Serve(listener)
+	_, err = workerrpc.NewClient(path).ReadRepositorySnapshot(workerrpc.RepositorySnapshotRequest{TenantID: "tenant", AgentID: "work", Repository: "org/private", Ref: "refs/heads/main", ExactCommitSHA: strings.Repeat("a", 40)})
+	if err == nil || !strings.Contains(err.Error(), "repository_snapshot_rejected") {
+		t.Fatalf("err = %v", err)
+	}
 }
 
 func (reader *stubBaseReader) ReadBase(workerrpc.BaseReadRequest) (workerrpc.BaseRead, error) {

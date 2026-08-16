@@ -17,15 +17,25 @@ import (
 )
 
 const (
-	HeaderTenant     = "X-Governance-Tenant"
-	HeaderAgent      = "X-Governance-Agent"
-	HeaderCredential = "X-Governance-Credential"
-	signatureTag     = "gitoversight-agent-v1"
+	HeaderTenant       = "X-Governance-Tenant"
+	HeaderAgent        = "X-Governance-Agent"
+	HeaderCredential   = "X-Governance-Credential"
+	HeaderRepository   = "X-Governance-Repository"
+	HeaderAssetSize    = "X-Release-Asset-Size"
+	HeaderAssetSHA256  = "X-Release-Asset-SHA256"
+	signatureTag       = "gitoversight-agent-v1"
+	uploadSignatureTag = "gitoversight-asset-upload-v1"
 )
 
 var signedComponents = []string{
 	"@method", "@authority", "@path", "@query", "content-digest",
 	strings.ToLower(HeaderTenant), strings.ToLower(HeaderAgent), strings.ToLower(HeaderCredential),
+}
+
+var uploadSignedComponents = []string{
+	"@method", "@authority", "@path", "@query", "authorization", "content-type",
+	strings.ToLower(HeaderTenant), strings.ToLower(HeaderAgent), strings.ToLower(HeaderCredential),
+	strings.ToLower(HeaderRepository), strings.ToLower(HeaderAssetSize), strings.ToLower(HeaderAssetSHA256),
 }
 
 type Identity struct {
@@ -61,6 +71,14 @@ type Middleware struct {
 	config      MiddlewareConfig
 }
 
+// UploadAuthenticator verifies a detached, body-independent signature for the
+// one raw release-asset ingress route. It never reads, replaces, or closes the
+// request body.
+type UploadAuthenticator struct {
+	credentials *CredentialService
+	config      MiddlewareConfig
+}
+
 func NewMiddleware(credentials *CredentialService, config MiddlewareConfig) (*Middleware, error) {
 	if credentials == nil {
 		return nil, errors.New("credential service is required")
@@ -78,6 +96,96 @@ func NewMiddleware(credentials *CredentialService, config MiddlewareConfig) (*Mi
 		config.Now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Middleware{credentials: credentials, config: config}, nil
+}
+
+func (middleware *Middleware) UploadAuthenticator() *UploadAuthenticator {
+	return &UploadAuthenticator{credentials: middleware.credentials, config: middleware.config}
+}
+
+func (authenticator *UploadAuthenticator) Verify(request *http.Request) (Identity, string, time.Time, error) {
+	if authenticator == nil || authenticator.credentials == nil || request == nil {
+		return Identity{}, "", time.Time{}, errors.New("upload authentication unavailable")
+	}
+	if err := rejectAmbiguousUploadRequest(request); err != nil {
+		return Identity{}, "", time.Time{}, err
+	}
+	tenantID := request.Header.Get(HeaderTenant)
+	claimedAgentID := request.Header.Get(HeaderAgent)
+	credentialID := request.Header.Get(HeaderCredential)
+	resolver := &credentialResolver{
+		ctx: request.Context(), service: authenticator.credentials,
+		tenantID: tenantID, credentialID: credentialID,
+	}
+	capture := &nonceCapture{}
+	verifier, err := httpsig.NewVerifier(
+		resolver,
+		httpsig.WithRequiredTag(uploadSignatureTag,
+			httpsig.WithRequiredComponents(uploadSignedComponents...),
+			httpsig.WithValidityTolerance(authenticator.config.ClockSkew),
+			httpsig.WithMaxAge(authenticator.config.SignatureTTL),
+			httpsig.WithCreatedTimestampRequired(true),
+			httpsig.WithExpiredTimestampRequired(true),
+		),
+		httpsig.WithNonceChecker(capture),
+	)
+	if err != nil || verifier.Verify(httpsig.MessageFromRequest(request)) != nil {
+		return Identity{}, "", time.Time{}, errors.New("unauthorized")
+	}
+	if resolver.credential == nil || !capture.present || strings.TrimSpace(capture.value) == "" ||
+		claimedAgentID == "" || claimedAgentID != resolver.credential.AgentID {
+		return Identity{}, "", time.Time{}, errors.New("unauthorized")
+	}
+	if authenticator.config.SourceLimiter != nil && !authenticator.config.SourceLimiter.Allow(tenantID+"/"+credentialID) {
+		return Identity{}, "", time.Time{}, errors.New("rate limit exceeded")
+	}
+	nonceExpiry := authenticator.config.Now().UTC().Add(authenticator.config.SignatureTTL + authenticator.config.ClockSkew)
+	return Identity{TenantID: tenantID, AgentID: resolver.credential.AgentID, CredentialID: credentialID}, capture.value, nonceExpiry, nil
+}
+
+func (authenticator *UploadAuthenticator) ConsumeNonce(ctx context.Context, identity Identity, nonce string) error {
+	if authenticator == nil || authenticator.credentials == nil {
+		return errors.New("upload authentication unavailable")
+	}
+	nonceExpiry := authenticator.config.Now().UTC().Add(authenticator.config.SignatureTTL + authenticator.config.ClockSkew)
+	if err := authenticator.credentials.ConsumeNonce(ctx, identity.TenantID, identity.CredentialID, nonce, nonceExpiry); err != nil {
+		return errors.New("unauthorized")
+	}
+	return nil
+}
+
+// SignUploadRequest signs only canonical request metadata. In particular, it
+// does not inspect or buffer request.Body.
+func SignUploadRequest(request *http.Request, privateKey ed25519.PrivateKey, identity Identity, nonce string, ttl time.Duration) error {
+	if request == nil || len(privateKey) != ed25519.PrivateKeySize {
+		return errors.New("request and Ed25519 private key are required")
+	}
+	if identity.TenantID == "" || identity.AgentID == "" || identity.CredentialID == "" || strings.TrimSpace(nonce) == "" || ttl <= 0 {
+		return errors.New("complete signing identity, nonce, and ttl are required")
+	}
+	request.Header.Set(HeaderTenant, identity.TenantID)
+	request.Header.Set(HeaderAgent, identity.AgentID)
+	request.Header.Set(HeaderCredential, identity.CredentialID)
+	signer, err := httpsig.NewSigner(
+		httpsig.Key{KeyID: credentialKeyID(identity.TenantID, identity.CredentialID), Algorithm: httpsig.Ed25519, Key: privateKey},
+		httpsig.WithTTL(ttl),
+		httpsig.WithTag(uploadSignatureTag),
+		httpsig.WithNonce(httpsig.NonceGetterFunc(func(context.Context) (string, error) { return nonce, nil })),
+		httpsig.WithComponents(uploadSignedComponents...),
+	)
+	if err != nil {
+		return err
+	}
+	headers, err := signer.Sign(httpsig.MessageFromRequest(request))
+	if err != nil {
+		return err
+	}
+	for name, values := range headers {
+		request.Header.Del(name)
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+	}
+	return nil
 }
 
 func (middleware *Middleware) Wrap(next http.Handler) http.Handler {
@@ -116,6 +224,24 @@ func (middleware *Middleware) Wrap(next http.Handler) http.Handler {
 		)
 		if err != nil || verifier.Verify(httpsig.MessageFromRequest(request)) != nil {
 			unauthorized(response)
+			return
+		}
+		// Past this point the signature has VERIFIED: the caller holds the private
+		// key for credentialID and has proven it. That changes what may safely be
+		// said. Every branch above stays opaque — distinguishing "revoked" from
+		// "no such credential" to an unauthenticated caller is a credential
+		// enumeration oracle. But an agent who has already proven key possession
+		// learns nothing from being told which of its own flags disagrees with its
+		// own credential, and the alternative is what actually happened:
+		//
+		// A caller can send a Unix account name instead of the credential's
+		// registered agent ID and incorrectly infer revocation from a generic
+		// unauthorized response. A wrong flag and a revoked credential require
+		// opposite recovery actions, so an authenticated caller receives this
+		// bounded mismatch hint.
+		if resolver.credential != nil && capture.present && strings.TrimSpace(capture.value) != "" &&
+			claimedAgentID != resolver.credential.AgentID {
+			unauthorizedWithHint(response, "agent_id_mismatch")
 			return
 		}
 		if resolver.credential == nil || claimedAgentID == "" || claimedAgentID != resolver.credential.AgentID || !capture.present || strings.TrimSpace(capture.value) == "" {
@@ -270,12 +396,44 @@ func rejectAmbiguousRequest(request *http.Request) error {
 	return nil
 }
 
+func rejectAmbiguousUploadRequest(request *http.Request) error {
+	if request == nil || request.Host == "" || request.URL == nil || request.URL.IsAbs() {
+		return errors.New("request target is incomplete")
+	}
+	for _, name := range []string{
+		HeaderTenant, HeaderAgent, HeaderCredential, HeaderRepository, HeaderAssetSize,
+		HeaderAssetSHA256, "Authorization", "Content-Type", "Signature", "Signature-Input",
+	} {
+		values := request.Header.Values(name)
+		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+			return fmt.Errorf("header %s must occur exactly once", name)
+		}
+	}
+	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Original-URL", "X-Rewrite-URL"} {
+		if len(request.Header.Values(name)) != 0 {
+			return fmt.Errorf("untrusted forwarding header %s", name)
+		}
+	}
+	return nil
+}
+
 func credentialKeyID(tenantID, credentialID string) string { return tenantID + "/" + credentialID }
 
 func unauthorized(response http.ResponseWriter) {
 	response.Header().Set("Content-Type", "application/json")
 	response.WriteHeader(http.StatusUnauthorized)
 	_, _ = response.Write([]byte(`{"error":"unauthorized"}`))
+}
+
+// unauthorizedWithHint names the failing precondition. Use it ONLY after the
+// signature has verified — the hint is safe there because the caller has already
+// proven key possession, and it is an enumeration oracle before that. The
+// top-level error string stays `unauthorized` so existing clients that match on
+// it keep working; the reason travels alongside.
+func unauthorizedWithHint(response http.ResponseWriter, reason string) {
+	response.Header().Set("Content-Type", "application/json")
+	response.WriteHeader(http.StatusUnauthorized)
+	_, _ = response.Write([]byte(`{"error":"unauthorized","reason":"` + reason + `"}`))
 }
 
 func sourceAddress(remoteAddr string) string {

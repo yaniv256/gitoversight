@@ -6,24 +6,28 @@ import (
 )
 
 type RouterConfig struct {
-	Readiness     *Readiness
-	AgentAuth     func(http.Handler) http.Handler
-	HumanAuth     func(bool, http.Handler) http.Handler
-	Authority     http.Handler
-	Enrollment    http.Handler
-	OAuth         http.Handler
-	Webhook       http.Handler
-	Subscriptions http.Handler
-	Read          http.Handler
-	Pulls         http.Handler
-	Search        http.Handler
-	Sync          http.Handler
-	Queue         http.Handler
-	SyncHuman     http.Handler
-	SearchHuman   http.Handler
-	UI            http.Handler
-	UIAuth        func(http.Handler) http.Handler
-	MaxConcurrent int
+	Readiness           *Readiness
+	AgentAuth           func(http.Handler) http.Handler
+	HumanAuth           func(bool, http.Handler) http.Handler
+	Authority           http.Handler
+	ReleaseAssets       http.Handler
+	Enrollment          http.Handler
+	OAuth               http.Handler
+	WorkOAuth           http.Handler
+	MCP                 http.Handler
+	RepositorySnapshots http.Handler
+	Webhook             http.Handler
+	Subscriptions       http.Handler
+	Read                http.Handler
+	Pulls               http.Handler
+	Search              http.Handler
+	Sync                http.Handler
+	Queue               http.Handler
+	SyncHuman           http.Handler
+	SearchHuman         http.Handler
+	UI                  http.Handler
+	UIAuth              func(http.Handler) http.Handler
+	MaxConcurrent       int
 }
 
 func NewRouter(config RouterConfig) http.Handler {
@@ -74,6 +78,49 @@ func NewRouter(config RouterConfig) http.Handler {
 		mux.Handle("/oauth/github/callback", ready(config.OAuth))
 		mux.Handle("/v1/oauth/github/begin", ready(human(true, config.OAuth)))
 	}
+	if config.WorkOAuth != nil {
+		// Static OAuth UI assets contain no tenant or credential data and must be
+		// reachable for pages protected by the global same-origin CSP.
+		mux.Handle("/v1/work/oauth/static/", ready(config.WorkOAuth))
+		mux.Handle("/.well-known/oauth-authorization-server", ready(config.WorkOAuth))
+		mux.Handle("/.well-known/oauth-protected-resource", ready(config.WorkOAuth))
+		mux.Handle("/oauth/token", ready(config.WorkOAuth))
+		mux.Handle("/oauth/revoke", ready(config.WorkOAuth))
+		mux.Handle("/oauth/authorize", ready(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodGet || request.Method == http.MethodHead {
+				if config.UIAuth == nil {
+					http.Error(response, "human page authentication unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				config.UIAuth(config.WorkOAuth).ServeHTTP(response, request)
+				return
+			}
+			human(true, config.WorkOAuth).ServeHTTP(response, request)
+		})))
+		mux.Handle("/v1/work/oauth/credentials", ready(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodGet {
+				if config.UIAuth == nil {
+					http.Error(response, "human page authentication unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				config.UIAuth(config.WorkOAuth).ServeHTTP(response, request)
+				return
+			}
+			human(true, config.WorkOAuth).ServeHTTP(response, request)
+		})))
+		mux.Handle("/v1/work/oauth/credentials/", ready(human(true, config.WorkOAuth)))
+	}
+	if config.MCP != nil {
+		// Streamable HTTP authenticates its own OAuth bearer and Origin. It must
+		// not pass through the local-agent signature middleware.
+		mux.Handle("/mcp", ready(config.MCP))
+	}
+	if config.RepositorySnapshots != nil {
+		// The opaque, short-lived, one-time URL is the capability. It is issued
+		// only after OAuth and repository-scope checks; never wrap the archive
+		// bytes in local-agent signature middleware or MCP JSON.
+		mux.Handle("/v1/repository-snapshots/", ready(config.RepositorySnapshots))
+	}
 	if config.Enrollment != nil {
 		mux.Handle("/v1/enrollments/challenge", ready(config.Enrollment))
 		mux.Handle("/v1/enrollments/", ready(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -115,6 +162,21 @@ func NewRouter(config RouterConfig) http.Handler {
 			}
 			agent(config.Authority).ServeHTTP(response, request)
 		}))
+		mux.Handle("/v1/policy/private-owner-additions", ready(agent(config.Authority)))
+		mux.Handle("/v1/policy/orchestrator", ready(agent(config.Authority)))
+	}
+	if config.ReleaseAssets != nil {
+		// The small metadata request uses ordinary agent authentication. The
+		// raw content route performs its own detached, body-independent proof;
+		// wrapping it with AgentAuth would buffer the entire asset.
+		mux.Handle("/v1/release-assets", ready(agent(config.ReleaseAssets)))
+		mux.Handle("/v1/release-assets/", ready(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodPut && strings.HasSuffix(request.URL.Path, "/content") {
+				config.ReleaseAssets.ServeHTTP(response, request)
+				return
+			}
+			agent(config.ReleaseAssets).ServeHTTP(response, request)
+		})))
 	}
 	if config.Subscriptions != nil {
 		mux.Handle("/v1/subscriptions", ready(agent(config.Subscriptions)))

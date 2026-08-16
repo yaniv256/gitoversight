@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaniv256/gitoversight.dev/internal/api"
 	"github.com/yaniv256/gitoversight.dev/internal/attribution"
 	"github.com/yaniv256/gitoversight.dev/internal/commitpacket"
 	"github.com/yaniv256/gitoversight.dev/internal/githubapp"
@@ -31,11 +32,13 @@ type prPreviewBases struct {
 	err     error
 }
 
+const testBaseTree = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 func (b prPreviewBases) ReadBase(workerrpc.BaseReadRequest) (workerrpc.BaseRead, error) {
 	if b.err != nil {
 		return workerrpc.BaseRead{}, b.err
 	}
-	return workerrpc.BaseRead{CommitSHA: "basecommit", TreeSHA: "basetree", Entries: b.entries}, nil
+	return workerrpc.BaseRead{CommitSHA: "basecommit", TreeSHA: testBaseTree, Entries: b.entries}, nil
 }
 
 func (b prPreviewBases) ReadBlob(_, sha string) ([]byte, error) {
@@ -49,7 +52,7 @@ func seedPrePR(t *testing.T, db *sqlite.DB, entries []commitpacket.TreeEntry, bl
 	treeSHA := gitTreeSHA(entries)
 	commitSHA := gitCommitSHA(treeSHA, "Release\n", author)
 	packet := commitpacket.Packet{
-		Tree:   commitpacket.Tree{SHA: treeSHA, Entries: entries},
+		Tree:   commitpacket.Tree{SHA: treeSHA, BaseTree: testBaseTree, Entries: entries},
 		Blobs:  blobs,
 		Commit: commitpacket.Commit{SHA: commitSHA, Message: "Release\n", Tree: treeSHA, Author: author, Committer: author},
 	}
@@ -142,10 +145,9 @@ func prePRFile(path, content string) (commitpacket.TreeEntry, commitpacket.Blob)
 		commitpacket.Blob{SHA: sha, Content: base64.StdEncoding.EncodeToString([]byte(content)), Encoding: "base64"}
 }
 
-// The page must show the actual DIFF, not a bare filename list. This is the
-// whole point: a human could previously authorize a public publication having
-// seen no content at all.
-func TestSyncPageRendersRealDiffLines(t *testing.T) {
+// The shell stays small; the exact diff is available from the authenticated
+// per-file route rather than being embedded in the initial response.
+func TestSyncPageLoadsRealDiffLinesLazily(t *testing.T) {
 	t.Parallel()
 	db := uiDB(t)
 	entry, blob := prePRFile("README.md", "hello world\n")
@@ -155,20 +157,131 @@ func TestSyncPageRendersRealDiffLines(t *testing.T) {
 		entries: []githubapp.TreeEntry{{Path: "README.md", Mode: "100644", Type: "blob", SHA: oldSHA}},
 		blobs:   map[string]string{oldSHA: "hello there\n"},
 	}
-	body := visibleText(renderPrePR(t, db, bases, nil))
-
-	if !strings.Contains(body, "+hello world") {
-		t.Fatalf("page is missing the added line:\n%s", body)
+	handler, err := ui.NewHandler(ui.Config{Store: db, Policy: everythingPolicy(), Pulls: &fakeLister{}, Bases: bases})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(body, "-hello there") {
-		t.Fatalf("page is missing the removed line:\n%s", body)
+	shell := httptest.NewRecorder()
+	handler.ServeHTTP(shell, uiGet("/ui/sync/pre-1"))
+	body := visibleText(shell.Body.String())
+	if strings.Contains(body, "+hello world") || strings.Contains(body, "-hello there") || strings.Contains(body, "@@") {
+		t.Fatal("initial page must not embed line diffs")
 	}
-	if !strings.Contains(body, "@@") {
-		t.Fatal("page is missing hunk headers")
+	if !strings.Contains(body, `data-diff-url="/ui/sync/pre-1/diff?path=README.md"`) {
+		t.Fatal("initial page is missing lazy diff URL")
 	}
 	// The count is emphasised, so the words are split by markup.
 	if !strings.Contains(body, "<strong>1</strong> file changed") {
 		t.Fatalf("page is missing its summary:\n%s", body)
+	}
+	fragment := httptest.NewRecorder()
+	handler.ServeHTTP(fragment, uiGet("/ui/sync/pre-1/diff?path=README.md"))
+	if fragment.Code != http.StatusOK {
+		t.Fatalf("diff status = %d: %s", fragment.Code, fragment.Body.String())
+	}
+	diff := visibleText(fragment.Body.String())
+	if !strings.Contains(diff, "+hello world") || !strings.Contains(diff, "-hello there") || !strings.Contains(diff, "@@") {
+		t.Fatalf("lazy route is missing exact diff:\n%s", diff)
+	}
+}
+
+type countingBases struct {
+	base               workerrpc.BaseRead
+	blobs              map[string]string
+	readBase, readBlob int
+}
+
+func (b *countingBases) ReadBase(workerrpc.BaseReadRequest) (workerrpc.BaseRead, error) {
+	b.readBase++
+	return b.base, nil
+}
+func (b *countingBases) ReadBlob(_ string, sha string) ([]byte, error) {
+	b.readBlob++
+	return []byte(b.blobs[sha]), nil
+}
+
+func TestLargeSyncShellReadsNoBlobsAndKeepsCompleteManifestAndWarnings(t *testing.T) {
+	db := uiDB(t)
+	entries := make([]commitpacket.TreeEntry, 0, 300)
+	blobs := make([]commitpacket.Blob, 0, 300)
+	baseEntries := make([]githubapp.TreeEntry, 0, 300)
+	baseBlobs := make(map[string]string)
+	for i := 299; i >= 0; i-- {
+		path := fmt.Sprintf("docs/%03d.md", i)
+		content := fmt.Sprintf("new %d\n", i)
+		if i == 299 {
+			content = "private zara@internal.example\n"
+		}
+		entry, blob := prePRFile(path, content)
+		entries, blobs = append(entries, entry), append(blobs, blob)
+		old := fmt.Sprintf("old %d\n", i)
+		sha := gitBlobSHA(old)
+		baseEntries = append(baseEntries, githubapp.TreeEntry{Path: path, Mode: "100644", Type: "blob", SHA: sha})
+		baseBlobs[sha] = old
+	}
+	seedPrePR(t, db, entries, blobs)
+	bases := &countingBases{base: workerrpc.BaseRead{CommitSHA: "basecommit", TreeSHA: testBaseTree, Entries: baseEntries}, blobs: baseBlobs}
+	handler, err := ui.NewHandler(ui.Config{Store: db, Policy: everythingPolicy(), Pulls: &fakeLister{}, Bases: bases,
+		PrivateIdentities: []attribution.Identity{{Name: "zara", Email: "zara@internal.example"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, uiGet("/ui/sync/pre-1"))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d", response.Code)
+	}
+	if bases.readBase != 1 || bases.readBlob != 0 {
+		t.Fatalf("reads base=%d blob=%d, want 1/0", bases.readBase, bases.readBlob)
+	}
+	body := visibleText(response.Body.String())
+	first, last := `id="f-docs/000.md"`, `id="f-docs/299.md"`
+	if !strings.Contains(body, first) || !strings.Contains(body, last) || strings.Index(body, first) > strings.Index(body, last) {
+		t.Fatal("complete ordered manifest missing")
+	}
+	if !strings.Contains(body, "Private identifiers would publish") {
+		t.Fatal("complete identity warning missing")
+	}
+	if strings.Contains(body, "new 0") || strings.Contains(body, "+") {
+		t.Fatal("shell contains diff content or counts")
+	}
+	fragment := httptest.NewRecorder()
+	handler.ServeHTTP(fragment, uiGet("/ui/sync/pre-1/diff?path=docs%2F123.md"))
+	if fragment.Code != http.StatusOK {
+		t.Fatalf("diff status=%d: %s", fragment.Code, fragment.Body.String())
+	}
+	if bases.readBase != 2 || bases.readBlob != 1 {
+		t.Fatalf("after diff reads base=%d blob=%d, want 2/1", bases.readBase, bases.readBlob)
+	}
+
+	unknown := httptest.NewRecorder()
+	handler.ServeHTTP(unknown, uiGet("/ui/sync/pre-1/diff?path=missing.md"))
+	if unknown.Code != http.StatusUnprocessableEntity || bases.readBlob != 1 {
+		t.Fatalf("unknown path status=%d blob reads=%d", unknown.Code, bases.readBlob)
+	}
+}
+
+func TestLazyDiffRefusesMovedBaseAndOtherTenant(t *testing.T) {
+	db := uiDB(t)
+	entry, blob := prePRFile("README.md", "new\n")
+	seedPrePR(t, db, []commitpacket.TreeEntry{entry}, []commitpacket.Blob{blob})
+	bases := &countingBases{base: workerrpc.BaseRead{TreeSHA: "different-tree"}}
+	handler, err := ui.NewHandler(ui.Config{Store: db, Bases: bases})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := httptest.NewRecorder()
+	handler.ServeHTTP(moved, uiGet("/ui/sync/pre-1/diff?path=README.md"))
+	if moved.Code != http.StatusConflict || !strings.Contains(moved.Body.String(), "base moved") || bases.readBlob != 0 {
+		t.Fatalf("moved base status=%d body=%q blob=%d", moved.Code, moved.Body.String(), bases.readBlob)
+	}
+	otherRequest := httptest.NewRequest(http.MethodGet, "/ui/sync/pre-1/diff?path=README.md", nil)
+	otherRequest.AddCookie(&http.Cookie{Name: "gitoversight_csrf", Value: "csrf-token-123"})
+	otherRequest = otherRequest.WithContext(api.WithHumanApprover(otherRequest.Context(), api.HumanApprover{TenantID: "other", ID: "yaniv"}))
+	other := httptest.NewRecorder()
+	handler.ServeHTTP(other, otherRequest)
+	if other.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant status=%d", other.Code)
 	}
 }
 

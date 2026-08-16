@@ -261,6 +261,11 @@ func (b *Broker) Authorize(authenticatedCaller string, request MutationRequest, 
 		}
 		actorMode, actorSubject = ActorHumanUser, humanID
 	}
+	if decision.Code == policy.Allowed && actorMode != ActorHumanUser {
+		if humanID, ok := humanForRepositoryOwner(b.humanLogins, request.Repository); ok {
+			actorMode, actorSubject = ActorHumanUser, humanID
+		}
+	}
 
 	if repository, ok := b.policy.Repositories[request.Repository]; ok && repository.Visibility == "public" && (actorMode != ActorHumanUser || actorSubject == "") {
 		_ = b.record(request.RequestID, "denied", "public_human_actor_required", now)

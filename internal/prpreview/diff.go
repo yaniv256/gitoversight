@@ -36,6 +36,9 @@ type FileDiff struct {
 	// Truncated marks a diff whose body was omitted for size. The path, kind,
 	// and counts remain — a file's EXISTENCE is never hidden, only its content.
 	Truncated bool
+	// CountsUnavailable distinguishes a pre-computation safety refusal from a
+	// normally truncated diff whose exact counts were already computed.
+	CountsUnavailable bool
 }
 
 // Hunk is a contiguous run of changed lines with its surrounding context.
@@ -55,6 +58,11 @@ type DiffLine struct {
 // and Truncated is set — never the path itself (KTD8).
 const maxDiffLines = 2000
 
+// The LCS implementation is quadratic in line count. Refuse that computation
+// before allocating its matrix; the file remains visible and reviewable by
+// other means, but opening a crafted file cannot exhaust the review service.
+const maxDiffWorkCells = 25_000_000
+
 // DiffFile computes the unified diff between a path's base content and its
 // proposed content. Either side may be nil: no base means an addition, no
 // proposal means a deletion.
@@ -66,6 +74,11 @@ func DiffFile(path string, base, proposed []byte, kind ChangeKind) FileDiff {
 	}
 	oldLines := splitLines(base)
 	newLines := splitLines(proposed)
+	if len(oldLines) > 0 && len(newLines) > maxDiffWorkCells/len(oldLines) {
+		result.Truncated = true
+		result.CountsUnavailable = true
+		return result
+	}
 	hunks, added, removed := unifiedHunks(oldLines, newLines)
 	result.Added, result.Removed = added, removed
 

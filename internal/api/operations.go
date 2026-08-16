@@ -7,10 +7,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/agentauth"
+	"github.com/yaniv256/gitoversight.dev/internal/brokerapp"
 	"github.com/yaniv256/gitoversight.dev/internal/policy"
 	"github.com/yaniv256/gitoversight.dev/internal/server"
 )
@@ -18,6 +20,10 @@ import (
 type AuthorityHandlerConfig struct {
 	MaxBodyBytes int64
 	Executor     OperationExecutor
+	// PolicyOrchestrators are transport-authenticated agents allowed to promote
+	// any valid, compare-and-swap-bound next policy generation. This is an
+	// administrative role, not a request for human review by proxy.
+	PolicyOrchestrators []string
 	// Queue clears an approval's queue entry once the human has decided it.
 	// Optional: nil leaves the queue untouched, which is the pre-existing
 	// behaviour and keeps every existing construction site valid.
@@ -35,19 +41,17 @@ type QueueCompleter interface {
 	CompleteQueueItemForRef(ctx context.Context, tenantID, kind, ref string, now time.Time) error
 }
 
-type OperationExecutor interface {
-	Execute(context.Context, server.DurableIdentity, string) (server.DurableResult, error)
-}
+type OperationExecutor = brokerapp.OperationExecutor
 
-type OperationReconciler interface {
-	Reconcile(context.Context, server.DurableIdentity, string) (server.DurableResult, error)
-}
+type OperationReconciler = brokerapp.OperationReconciler
 
 type AuthorityHandler struct {
-	broker       *server.DurableBroker
-	maxBodyBytes int64
-	executor     OperationExecutor
-	queue        QueueCompleter
+	broker              *server.DurableBroker
+	operations          *brokerapp.OperationService
+	maxBodyBytes        int64
+	executor            OperationExecutor
+	queue               QueueCompleter
+	policyOrchestrators map[string]struct{}
 }
 
 // completeQueueEntry clears the reviewer's queue entry for a decided approval.
@@ -66,7 +70,16 @@ func NewAuthorityHandler(broker *server.DurableBroker, config AuthorityHandlerCo
 	if limit <= 0 {
 		limit = 1 << 20
 	}
-	return &AuthorityHandler{broker: broker, maxBodyBytes: limit, executor: config.Executor, queue: config.Queue}
+	orchestrators := make(map[string]struct{}, len(config.PolicyOrchestrators))
+	for _, agentID := range config.PolicyOrchestrators {
+		if agentID != "" {
+			orchestrators[agentID] = struct{}{}
+		}
+	}
+	return &AuthorityHandler{
+		broker: broker, operations: brokerapp.NewOperationService(broker, config.Executor),
+		maxBodyBytes: limit, executor: config.Executor, queue: config.Queue, policyOrchestrators: orchestrators,
+	}
 }
 
 func (handler *AuthorityHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -81,6 +94,14 @@ func (handler *AuthorityHandler) ServeHTTP(response http.ResponseWriter, request
 	}
 	if request.Method == http.MethodPost && path == "v1/policy" {
 		handler.promotePolicy(response, request)
+		return
+	}
+	if request.Method == http.MethodPost && path == "v1/policy/private-owner-additions" {
+		handler.promotePrivateOwnerAdditions(response, request)
+		return
+	}
+	if request.Method == http.MethodPost && path == "v1/policy/orchestrator" {
+		handler.promotePolicyAsOrchestrator(response, request)
 		return
 	}
 	parts := strings.Split(path, "/")
@@ -121,12 +142,11 @@ func (handler *AuthorityHandler) reconcileOperation(response http.ResponseWriter
 		writeError(response, http.StatusUnauthorized, "agent_authentication_required")
 		return
 	}
-	reconciler, ok := handler.executor.(OperationReconciler)
-	if !ok {
+	result, err := handler.operations.Reconcile(request.Context(), brokerapp.Identity{TenantID: identity.TenantID, AgentID: identity.AgentID}, operationID)
+	if errors.Is(err, brokerapp.ErrReconciliationUnavailable) {
 		writeError(response, http.StatusServiceUnavailable, "reconciliation_unavailable")
 		return
 	}
-	result, err := reconciler.Reconcile(request.Context(), server.DurableIdentity{TenantID: identity.TenantID, AgentID: identity.AgentID}, operationID)
 	if errors.Is(err, server.ErrDurableForbidden) {
 		writeError(response, http.StatusForbidden, "operation_forbidden")
 		return
@@ -205,6 +225,170 @@ func (handler *AuthorityHandler) promotePolicy(response http.ResponseWriter, req
 	writeJSON(response, http.StatusCreated, status)
 }
 
+type policyPromotionInput struct {
+	TenantID           string          `json:"tenant_id"`
+	ExpectedGeneration uint64          `json:"expected_generation"`
+	ExpectedPolicyHash string          `json:"expected_policy_hash"`
+	Snapshot           policy.Snapshot `json:"snapshot"`
+}
+
+func (handler *AuthorityHandler) promotePolicyAsOrchestrator(response http.ResponseWriter, request *http.Request) {
+	identity, ok := agentauth.IdentityFromContext(request.Context())
+	if !ok {
+		writeError(response, http.StatusUnauthorized, "agent_authentication_required")
+		return
+	}
+	if _, ok := handler.policyOrchestrators[identity.AgentID]; !ok {
+		writeError(response, http.StatusForbidden, "policy_orchestrator_required")
+		return
+	}
+	var input policyPromotionInput
+	if err := handler.decode(request, &input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_policy_promotion")
+		return
+	}
+	if input.TenantID == "" || identity.TenantID != input.TenantID {
+		writeError(response, http.StatusForbidden, "policy_tenant_mismatch")
+		return
+	}
+	if err := input.Snapshot.Validate(); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_policy_snapshot")
+		return
+	}
+	handler.promotePolicyForActor(response, request, input, "agent:"+identity.AgentID)
+}
+
+func (handler *AuthorityHandler) promotePolicyForActor(response http.ResponseWriter, request *http.Request, input policyPromotionInput, actor string) {
+	if err := handler.broker.PromotePolicy(request.Context(), input.TenantID, actor, input.ExpectedGeneration, input.ExpectedPolicyHash, input.Snapshot); err != nil {
+		if errors.Is(err, server.ErrDurablePolicy) || errors.Is(err, server.ErrDurableInvalid) {
+			writeError(response, http.StatusConflict, "policy_promotion_rejected")
+			return
+		}
+		writeError(response, http.StatusServiceUnavailable, "authority_unavailable")
+		return
+	}
+	status, err := handler.broker.PolicyStatus(request.Context(), input.TenantID)
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "policy_unavailable")
+		return
+	}
+	writeJSON(response, http.StatusCreated, status)
+}
+
+func (handler *AuthorityHandler) promotePrivateOwnerAdditions(response http.ResponseWriter, request *http.Request) {
+	identity, ok := agentauth.IdentityFromContext(request.Context())
+	if !ok {
+		writeError(response, http.StatusUnauthorized, "agent_authentication_required")
+		return
+	}
+	if _, ok := handler.policyOrchestrators[identity.AgentID]; !ok {
+		writeError(response, http.StatusForbidden, "policy_orchestrator_required")
+		return
+	}
+	var input policyPromotionInput
+	if err := handler.decode(request, &input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_policy_promotion")
+		return
+	}
+	if input.TenantID == "" || identity.TenantID != input.TenantID {
+		writeError(response, http.StatusForbidden, "policy_tenant_mismatch")
+		return
+	}
+	current, err := handler.broker.PolicySnapshot(request.Context(), input.TenantID)
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "policy_unavailable")
+		return
+	}
+	if err := validatePrivateOwnerAdditions(current, input.Snapshot); err != nil {
+		writeError(response, http.StatusForbidden, "private_owner_additions_only")
+		return
+	}
+	actor := "agent:" + identity.AgentID
+	if err := handler.broker.PromotePolicy(request.Context(), input.TenantID, actor, input.ExpectedGeneration, input.ExpectedPolicyHash, input.Snapshot); err != nil {
+		if errors.Is(err, server.ErrDurablePolicy) || errors.Is(err, server.ErrDurableInvalid) {
+			writeError(response, http.StatusConflict, "policy_promotion_rejected")
+			return
+		}
+		writeError(response, http.StatusServiceUnavailable, "authority_unavailable")
+		return
+	}
+	status, err := handler.broker.PolicyStatus(request.Context(), input.TenantID)
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "policy_unavailable")
+		return
+	}
+	writeJSON(response, http.StatusCreated, status)
+}
+
+func validatePrivateOwnerAdditions(current, next policy.Snapshot) error {
+	if next.Generation != current.Generation+1 ||
+		current.FallbackOwner != next.FallbackOwner ||
+		current.FallbackPermissions != next.FallbackPermissions ||
+		current.QueueCurator != next.QueueCurator ||
+		!reflect.DeepEqual(current.Agents, next.Agents) ||
+		!reflect.DeepEqual(current.BranchGrants, next.BranchGrants) ||
+		len(current.Repositories) != len(next.Repositories) {
+		return errors.New("policy contains changes outside private owner additions")
+	}
+	changed := false
+	for name, before := range current.Repositories {
+		after, ok := next.Repositories[name]
+		if !ok {
+			return errors.New("repository set changed")
+		}
+		beforeWithoutOwners, afterWithoutOwners := before, after
+		beforeWithoutOwners.Owners, afterWithoutOwners.Owners = nil, nil
+		if !reflect.DeepEqual(beforeWithoutOwners, afterWithoutOwners) {
+			return errors.New("repository policy changed outside owners")
+		}
+		if reflect.DeepEqual(before.Owners, after.Owners) {
+			continue
+		}
+		if before.Visibility != "private" || before.ProtectedPolicy {
+			return errors.New("owner additions require an ordinary private repository")
+		}
+		for _, owner := range before.Owners {
+			if !containsString(after.Owners, owner) {
+				return errors.New("owner removal is not allowed")
+			}
+		}
+		seenOwners := make(map[string]struct{}, len(after.Owners))
+		added := 0
+		for _, owner := range after.Owners {
+			if owner == "" {
+				return errors.New("owner id is required")
+			}
+			if _, duplicate := seenOwners[owner]; duplicate {
+				return errors.New("duplicate owner is not allowed")
+			}
+			seenOwners[owner] = struct{}{}
+			if !containsString(before.Owners, owner) {
+				if _, registered := current.Agents[owner]; !registered {
+					return errors.New("new owner must be a registered agent")
+				}
+				added++
+			}
+		}
+		if added == 0 {
+			return errors.New("at least one owner must be added")
+		}
+		changed = true
+	}
+	if !changed {
+		return errors.New("no private owner addition")
+	}
+	return next.Validate()
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func (handler *AuthorityHandler) revoke(response http.ResponseWriter, request *http.Request, operationID string) {
 	identity, ok := agentauth.IdentityFromContext(request.Context())
 	if !ok {
@@ -274,13 +458,25 @@ func (handler *AuthorityHandler) submit(response http.ResponseWriter, request *h
 		writeError(response, http.StatusBadRequest, "invalid_operation")
 		return
 	}
-	result, err := handler.broker.Submit(request.Context(), server.DurableIdentity{TenantID: identity.TenantID, AgentID: identity.AgentID}, server.DurableOperationRequest{
+	result, err := handler.operations.Submit(request.Context(), brokerapp.Identity{TenantID: identity.TenantID, AgentID: identity.AgentID, CredentialID: identity.CredentialID}, brokerapp.OperationRequest{
 		ID: input.ID, Repository: input.Repository, Operation: input.Operation, Branch: input.Branch,
 		Title: input.Title, Body: input.Body, HeadSHA: input.HeadSHA, ManifestHash: input.ManifestHash,
 		ApprovalID: input.ApprovalID, ApprovalNonce: input.ApprovalNonce,
 		ApprovalExpiresAt: input.ApprovalExpiresAt, Approver: input.Approver, Payload: input.Payload,
 	})
+	if result.Executed {
+		if errors.Is(err, brokerapp.ErrExecutionUnavailable) {
+			writeError(response, http.StatusServiceUnavailable, "execution_unavailable")
+			return
+		}
+		handler.writeExecutionResult(response, result.Result, err, http.StatusCreated)
+		return
+	}
 	if err != nil {
+		if errors.Is(err, server.ErrStreamedAssetRequired) {
+			writeActionError(response, http.StatusBadRequest, "streamed_asset_required", "release-asset-stage")
+			return
+		}
 		if errors.Is(err, server.ErrDurableInvalid) {
 			writeError(response, http.StatusBadRequest, "invalid_operation")
 			return
@@ -288,13 +484,11 @@ func (handler *AuthorityHandler) submit(response http.ResponseWriter, request *h
 		writeError(response, http.StatusServiceUnavailable, "authority_unavailable")
 		return
 	}
-	switch result.State {
-	case server.DurableAuthorized:
-		handler.execute(response, request, server.DurableIdentity{TenantID: identity.TenantID, AgentID: identity.AgentID}, result.ID, http.StatusCreated)
+	switch result.Result.State {
 	case server.DurableAwaitingApproval:
-		writeJSON(response, http.StatusAccepted, result)
+		writeJSON(response, http.StatusAccepted, result.Result)
 	default:
-		writeJSON(response, http.StatusForbidden, result)
+		writeJSON(response, http.StatusForbidden, result.Result)
 	}
 }
 
@@ -304,7 +498,7 @@ func (handler *AuthorityHandler) status(response http.ResponseWriter, request *h
 		writeError(response, http.StatusUnauthorized, "agent_authentication_required")
 		return
 	}
-	result, err := handler.broker.Status(request.Context(), server.DurableIdentity{TenantID: identity.TenantID, AgentID: identity.AgentID}, operationID)
+	result, err := handler.operations.Status(request.Context(), brokerapp.Identity{TenantID: identity.TenantID, AgentID: identity.AgentID}, operationID)
 	if errors.Is(err, server.ErrDurableForbidden) {
 		writeError(response, http.StatusForbidden, "operation_forbidden")
 		return
@@ -413,6 +607,10 @@ func (handler *AuthorityHandler) execute(response http.ResponseWriter, request *
 		return
 	}
 	result, err := handler.executor.Execute(request.Context(), identity, operationID)
+	handler.writeExecutionResult(response, result, err, successStatus)
+}
+
+func (handler *AuthorityHandler) writeExecutionResult(response http.ResponseWriter, result server.DurableResult, err error, successStatus int) {
 	if err != nil {
 		if result.ID != "" {
 			writeJSON(response, http.StatusBadGateway, result)

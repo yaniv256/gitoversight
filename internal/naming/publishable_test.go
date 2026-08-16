@@ -48,12 +48,16 @@ var unpublishablePaths = []string{
 }
 
 // unpublishableContent matches infrastructure that is real rather than
-// illustrative. The hostnames come from the private-hostname scan in
-// ci/workflow-ci.yml.pending, which cannot run: the GitOversight App lacks the
-// `workflows` permission, so .github/workflows/ci.yml can never be written
-// (see ci/README.md). A guard living only in a workflow file is a guard that
-// never executes, so it lives here, where `go test ./...` runs it in every
-// environment — local, CI, and any clone.
+// illustrative. The hostnames mirror the private-hostname scan in
+// .github/workflows/ci.yml, which sat unrunnable at ci/workflow-ci.yml.pending
+// until 2026-07-27 — the App had no `workflows` scope, so that path could not
+// be written at all.
+//
+// The guard stays here now that CI runs, because the reason outlived the
+// permission: a rule that lives only in a workflow file is a rule that a clone,
+// a fork, or a local `go test ./...` never executes. Here it runs in every
+// environment, and a change that trips it fails before it can be pushed rather
+// than after.
 var unpublishableContent = []*regexp.Regexp{
 	regexp.MustCompile(`\b3\.140\.105\.110\b`),
 	regexp.MustCompile(`(?i)\bhey-code\.ai\b`),

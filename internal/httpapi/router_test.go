@@ -3,8 +3,10 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,6 +43,56 @@ func TestRouterKeepsLivenessSeparateAndGatesMutationsOnReadiness(t *testing.T) {
 	}
 }
 
+func TestRouterBypassesBodyBufferingAgentAuthOnlyForExactRawAssetRoute(t *testing.T) {
+	var agentCalls int
+	var bodyReads int
+	releaseAssets := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		buffer := make([]byte, 1)
+		if strings.HasSuffix(request.URL.Path, "/content") {
+			_, _ = request.Body.Read(buffer)
+		}
+		response.WriteHeader(http.StatusNoContent)
+	})
+	router := NewRouter(RouterConfig{
+		Readiness: NewReadiness([]Check{CheckFunc{CheckName: "ok", Run: func(context.Context) error { return nil }}}),
+		AgentAuth: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				agentCalls++
+				next.ServeHTTP(response, request)
+			})
+		},
+		ReleaseAssets: releaseAssets,
+		MaxConcurrent: 2,
+	})
+	issue := httptest.NewRequest(http.MethodPost, "/v1/release-assets", nil)
+	router.ServeHTTP(httptest.NewRecorder(), issue)
+	if agentCalls != 1 {
+		t.Fatalf("metadata agent auth calls = %d", agentCalls)
+	}
+	raw := httptest.NewRequest(http.MethodPut, "/v1/release-assets/0123456789abcdef0123456789abcdef/content", &routerCountingReader{reads: &bodyReads})
+	router.ServeHTTP(httptest.NewRecorder(), raw)
+	if agentCalls != 1 {
+		t.Fatalf("raw upload invoked body-signing auth: calls=%d", agentCalls)
+	}
+	if bodyReads != 1 {
+		t.Fatalf("raw handler body reads = %d", bodyReads)
+	}
+	status := httptest.NewRequest(http.MethodGet, "/v1/release-assets/0123456789abcdef0123456789abcdef?repository=yaniv256/private", nil)
+	router.ServeHTTP(httptest.NewRecorder(), status)
+	if agentCalls != 2 {
+		t.Fatalf("status did not use agent auth: calls=%d", agentCalls)
+	}
+}
+
+type routerCountingReader struct {
+	reads *int
+}
+
+func (reader *routerCountingReader) Read([]byte) (int, error) {
+	(*reader.reads)++
+	return 0, io.EOF
+}
+
 func TestRouterUsesHumanAuthForPolicyPromotionAndAgentAuthForPolicyRead(t *testing.T) {
 	readiness := NewReadiness([]Check{CheckFunc{CheckName: "ready", Run: func(context.Context) error { return nil }}})
 	var agentCalls, humanCalls int
@@ -70,8 +122,67 @@ func TestRouterUsesHumanAuthForPolicyPromotionAndAgentAuthForPolicyRead(t *testi
 			t.Fatalf("%s policy status = %d", method, response.Code)
 		}
 	}
-	if agentCalls != 1 || humanCalls != 1 {
+	scopedResponse := httptest.NewRecorder()
+	router.ServeHTTP(scopedResponse, httptest.NewRequest(http.MethodPost, "https://gitoversight.test/v1/policy/private-owner-additions", nil))
+	if scopedResponse.Code != http.StatusNoContent {
+		t.Fatalf("scoped policy promotion = %d", scopedResponse.Code)
+	}
+	orchestratorResponse := httptest.NewRecorder()
+	router.ServeHTTP(orchestratorResponse, httptest.NewRequest(http.MethodPost, "https://gitoversight.test/v1/policy/orchestrator", nil))
+	if orchestratorResponse.Code != http.StatusNoContent {
+		t.Fatalf("orchestrator policy promotion = %d", orchestratorResponse.Code)
+	}
+	if agentCalls != 3 || humanCalls != 1 {
 		t.Fatalf("auth calls: agent=%d human=%d", agentCalls, humanCalls)
+	}
+}
+
+func TestRouterAppliesMethodSpecificWorkOAuthAndMCPBoundaries(t *testing.T) {
+	readiness := NewReadiness([]Check{CheckFunc{CheckName: "ready", Run: func(context.Context) error { return nil }}})
+	var humanCalls, pageCalls, agentCalls int
+	oauth := http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) { response.WriteHeader(http.StatusNoContent) })
+	mcp := http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) { response.WriteHeader(http.StatusAccepted) })
+	router := NewRouter(RouterConfig{
+		Readiness: readiness,
+		AgentAuth: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				agentCalls++
+				next.ServeHTTP(response, request)
+			})
+		},
+		HumanAuth: func(_ bool, next http.Handler) http.Handler {
+			return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				humanCalls++
+				next.ServeHTTP(response, request)
+			})
+		},
+		UIAuth: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				pageCalls++
+				next.ServeHTTP(response, request)
+			})
+		},
+		WorkOAuth: oauth, MCP: mcp,
+	})
+	for _, test := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodGet, "/.well-known/oauth-authorization-server", http.StatusNoContent},
+		{http.MethodGet, "/oauth/authorize", http.StatusNoContent},
+		{http.MethodPost, "/oauth/authorize", http.StatusNoContent},
+		{http.MethodPost, "/oauth/token", http.StatusNoContent},
+		{http.MethodPost, "/mcp", http.StatusAccepted},
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(test.method, "https://gitoversight.test"+test.path, nil))
+		if response.Code != test.want {
+			t.Fatalf("%s %s = %d", test.method, test.path, response.Code)
+		}
+	}
+	if pageCalls != 1 || humanCalls != 1 || agentCalls != 0 {
+		t.Fatalf("auth calls page=%d human=%d agent=%d", pageCalls, humanCalls, agentCalls)
 	}
 }
 
@@ -319,7 +430,7 @@ func TestSecurityHeadersAllowSameOriginApprovalRequests(t *testing.T) {
 		response.WriteHeader(http.StatusNoContent)
 	})).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://gitoversight.test", nil))
 
-	const want = "default-src 'none'; connect-src 'self'; frame-ancestors 'none'"
+	const want = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'"
 	if got := response.Header().Get("Content-Security-Policy"); got != want {
 		t.Fatalf("Content-Security-Policy = %q, want %q", got, want)
 	}

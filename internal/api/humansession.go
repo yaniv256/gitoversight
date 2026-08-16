@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,16 +20,14 @@ import (
 var ErrHumanSessionRejected = errors.New("human session rejected")
 
 type HumanSessionConfig struct {
-	SessionTTL    time.Duration
-	RecentAuthTTL time.Duration
-	Now           func() time.Time
+	SessionTTL time.Duration
+	Now        func() time.Time
 }
 
 type HumanSessionManager struct {
-	db            *sqlite.DB
-	sessionTTL    time.Duration
-	recentAuthTTL time.Duration
-	now           func() time.Time
+	db         *sqlite.DB
+	sessionTTL time.Duration
+	now        func() time.Time
 }
 
 type HumanSessionCredentials struct {
@@ -38,13 +37,13 @@ type HumanSessionCredentials struct {
 }
 
 func NewHumanSessionManager(db *sqlite.DB, config HumanSessionConfig) (*HumanSessionManager, error) {
-	if db == nil || config.SessionTTL <= 0 || config.RecentAuthTTL <= 0 || config.RecentAuthTTL > config.SessionTTL {
+	if db == nil || config.SessionTTL <= 0 {
 		return nil, errors.New("database and valid human session lifetimes are required")
 	}
 	if config.Now == nil {
 		config.Now = func() time.Time { return time.Now().UTC() }
 	}
-	return &HumanSessionManager{db: db, sessionTTL: config.SessionTTL, recentAuthTTL: config.RecentAuthTTL, now: config.Now}, nil
+	return &HumanSessionManager{db: db, sessionTTL: config.SessionTTL, now: config.Now}, nil
 }
 
 func (manager *HumanSessionManager) Begin(ctx context.Context, tenantID string) (HumanSessionCredentials, error) {
@@ -77,11 +76,10 @@ func (manager *HumanSessionManager) Authenticate(ctx context.Context, pendingTok
 	if err != nil {
 		return HumanSessionCredentials{}, err
 	}
-	recentUntil := now.Add(manager.recentAuthTTL)
 	record := storage.HumanSession{
 		TenantID: tenantID, IDHash: hashSecret(replacement.Token), HumanID: humanID,
 		CSRFHash: hashSecret(replacement.CSRF), CreatedAt: now, AuthenticatedAt: &now,
-		RecentAuthUntil: &recentUntil, ExpiresAt: replacement.ExpiresAt,
+		ExpiresAt: replacement.ExpiresAt,
 	}
 	if err := manager.db.WithTx(ctx, func(tx *sqlite.Tx) error {
 		return tx.RotateHumanSession(ctx, tenantID, hashSecret(pendingToken), record, now)
@@ -91,7 +89,7 @@ func (manager *HumanSessionManager) Authenticate(ctx context.Context, pendingTok
 	return replacement, nil
 }
 
-func (manager *HumanSessionManager) Authorize(ctx context.Context, token, csrf string, requireRecent bool) (HumanApprover, error) {
+func (manager *HumanSessionManager) Authorize(ctx context.Context, token, csrf string) (HumanApprover, error) {
 	tenantID, err := tenantFromSessionToken(token)
 	if err != nil || token == "" || csrf == "" {
 		return HumanApprover{}, ErrHumanSessionRejected
@@ -99,9 +97,6 @@ func (manager *HumanSessionManager) Authorize(ctx context.Context, token, csrf s
 	record, err := manager.db.HumanSession(ctx, tenantID, hashSecret(token))
 	now := manager.now().UTC()
 	if err != nil || record.HumanID == "" || record.AuthenticatedAt == nil || record.RevokedAt != nil || !now.Before(record.ExpiresAt) || subtle.ConstantTimeCompare([]byte(record.CSRFHash), []byte(hashSecret(csrf))) != 1 {
-		return HumanApprover{}, ErrHumanSessionRejected
-	}
-	if requireRecent && (record.RecentAuthUntil == nil || !now.Before(*record.RecentAuthUntil)) {
 		return HumanApprover{}, ErrHumanSessionRejected
 	}
 	return HumanApprover{TenantID: record.TenantID, ID: record.HumanID, SessionID: record.IDHash}, nil
@@ -130,21 +125,53 @@ func (manager *HumanSessionManager) Cookie(token string) *http.Cookie {
 	}
 }
 
+// CSRFCookie is Lax for the same reason the session cookie is, and getting this
+// wrong produced a login loop that looked like an authentication failure.
+//
+// This cookie is not only an anti-CSRF token: the UI READS it at render time
+// (internal/ui/ui.go) to populate <meta name="csrf-token">, which app.js then
+// sends as X-CSRF-Token. So it must survive the redirect arriving FROM
+// github.com, exactly like the session cookie.
+//
+// Under Strict it did not. Returning from OAuth, the browser sent the session
+// cookie (Lax) but withheld this one, so the page rendered an EMPTY token, the
+// POST carried an empty X-CSRF-Token, Authorize rejected it, and the client
+// concluded "you need a fresh sign-in" — sending the reviewer back through the
+// login that had just succeeded. Observed live 2026-07-27, three cycles.
+//
+// Making only the session cookie Lax is what created the loop: with both Strict
+// the page redirected to login and failed honestly; with one Lax the reviewer
+// reached a page whose publish button could never work.
+//
+// Lax is not a weakening for the CSRF role either. It still withholds the
+// cookie on cross-site POSTs — the attack this token defends against — while
+// allowing the top-level GET navigation that returns from an identity
+// provider. Both cookies now travel together or not at all.
 func (manager *HumanSessionManager) CSRFCookie(token string) *http.Cookie {
 	return &http.Cookie{
 		Name: "gitoversight_csrf", Value: token, Path: "/", Secure: true,
-		SameSite: http.SameSiteStrictMode, MaxAge: int(manager.sessionTTL.Seconds()),
+		SameSite: http.SameSiteLaxMode, MaxAge: int(manager.sessionTTL.Seconds()),
 	}
 }
 
-func (manager *HumanSessionManager) Protect(requireRecent bool, next http.Handler) http.Handler {
+func (manager *HumanSessionManager) Protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		cookie, err := request.Cookie("gitoversight_session")
 		if err != nil {
 			writeError(response, http.StatusUnauthorized, "human_authentication_required")
 			return
 		}
-		approver, err := manager.Authorize(request.Context(), cookie.Value, request.Header.Get("X-CSRF-Token"), requireRecent)
+		// Name WHICH precondition failed. A single opaque rejection is what let
+		// an empty CSRF token masquerade as an expired session for an entire
+		// evening: the client guessed "sign in again", the guess was wrong, and
+		// nothing in the response could correct it. Neither value is secret —
+		// the caller supplied both — so saying which one is missing leaks
+		// nothing and ends the guessing.
+		if request.Header.Get("X-CSRF-Token") == "" {
+			writeError(response, http.StatusForbidden, "csrf_token_missing")
+			return
+		}
+		approver, err := manager.Authorize(request.Context(), cookie.Value, request.Header.Get("X-CSRF-Token"))
 		if err != nil {
 			writeError(response, http.StatusForbidden, "human_session_rejected")
 			return
@@ -215,14 +242,22 @@ func (manager *HumanSessionManager) ProtectPage(next http.Handler) http.Handler 
 		}
 		cookie, err := request.Cookie("gitoversight_session")
 		if err != nil {
-			http.Redirect(response, request, "/login/github", http.StatusFound)
+			http.Redirect(response, request, loginRedirectFor(request), http.StatusFound)
 			return
 		}
 		approver, err := manager.AuthorizeSession(request.Context(), cookie.Value)
 		if err != nil {
-			http.Redirect(response, request, "/login/github", http.StatusFound)
+			http.Redirect(response, request, loginRedirectFor(request), http.StatusFound)
 			return
 		}
 		next.ServeHTTP(response, request.WithContext(WithHumanApprover(request.Context(), approver)))
 	})
+}
+
+func loginRedirectFor(request *http.Request) string {
+	returnTo := request.URL.RequestURI()
+	if returnTo == "" {
+		returnTo = "/ui/now"
+	}
+	return "/login/github?return_to=" + url.QueryEscape(returnTo)
 }

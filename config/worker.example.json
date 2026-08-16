@@ -26,5 +26,6 @@
     "example/gitoversight.dev": "private"
   },
   "search_db_path": "/var/lib/gitoversight-search/search.db",
-  "search_sync_interval": "1h"
+  "search_sync_interval": "1h",
+  "release_asset_root": "/var/lib/gitoversight-release-assets"
 }

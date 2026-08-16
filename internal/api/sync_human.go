@@ -149,7 +149,11 @@ func (handler *SyncHumanHandler) authorize(response http.ResponseWriter, request
 		return
 	}
 	identity := server.DurableIdentity{TenantID: approver.TenantID, AgentID: sync.CreatedBy}
-	branch := "sync/" + id
+	// The proposal id is private orchestration metadata and commonly includes
+	// the creating agent's name. Never copy it into a public Git branch. The
+	// proposal hash is already bound to the reviewed text, manifest, head, and
+	// packet, so it gives this publication a stable public-safe branch identity.
+	branch := "sync/" + shortSHA(sync.ProposalHash)
 
 	var packetPayload map[string]any
 	if err := json.Unmarshal([]byte(sync.CommitPacketJSON), &packetPayload); err != nil {
@@ -162,10 +166,35 @@ func (handler *SyncHumanHandler) authorize(response http.ResponseWriter, request
 		Branch: branch, HeadSHA: sync.PacketHeadSHA, ManifestHash: sync.ProposalHash,
 		Payload: packetPayload,
 	}
-	if _, err := handler.runChainOrReconcile(request.Context(), identity, approver, pushRequest); err != nil {
-		handler.receiptFailure(request.Context(), approver.TenantID, id, "sync_publish_failed", "branch push: "+err.Error(), handler.now())
-		writeJSON(response, http.StatusBadGateway, map[string]any{"error": "sync_publish_failed", "stage": "branch.push", "detail": err.Error(), "state": "authorized"})
-		return
+	pushRequest.ID = handler.retryableOperationID(request.Context(), approver.TenantID, pushRequest.ID)
+	// SKIP a push that already succeeded — do not re-submit it.
+	//
+	// Publishing 302 blobs takes long enough that GitHub's read replica lags
+	// the write. The immediate reconcile answered "absent", KTD1a correctly
+	// refused to call that terminal and parked the operation indeterminate, and
+	// the chain treated "I cannot confirm yet" as "this failed" — aborting
+	// before the pull request was ever created.
+	//
+	// Retrying then hit the replay guard, which is right: the operation id had
+	// been submitted, and re-submitting an executed public write is exactly
+	// what that guard exists to prevent. The bug is not the guard. It is asking
+	// to re-run a step whose work is already done. So the chain now CHECKS
+	// FIRST and resumes from where it actually is.
+	//
+	// Live 2026-07-27: branch on GitHub with all 302 files, push reconciled
+	// VERIFIED, no pull request, and every retry answered "already submitted".
+	// The publication was complete except for its last step and could not
+	// proceed by any route available to the reviewer.
+	if !handler.alreadyPublished(request.Context(), approver.TenantID, pushRequest.ID) {
+		if _, err := handler.runChainOrReconcile(request.Context(), identity, approver, pushRequest); err != nil {
+			// Re-check: the chain reports an error for "unconfirmed" as well as
+			// for "failed", and only the second should stop publication.
+			if !handler.alreadyPublished(request.Context(), approver.TenantID, pushRequest.ID) {
+				handler.receiptFailure(request.Context(), approver.TenantID, id, "sync_publish_failed", "branch push: "+err.Error(), handler.now())
+				writeJSON(response, http.StatusBadGateway, map[string]any{"error": "sync_publish_failed", "stage": "branch.push", "detail": err.Error(), "state": "authorized"})
+				return
+			}
+		}
 	}
 	title := strings.SplitN(strings.TrimSpace(sync.AuthorizedText), "\n", 2)[0]
 	if title == "" {
@@ -177,7 +206,14 @@ func (handler *SyncHumanHandler) authorize(response http.ResponseWriter, request
 		HeadSHA: sync.PacketHeadSHA, ManifestHash: sync.ProposalHash,
 		Payload: map[string]any{"base": handler.baseBranch, "head_sha": sync.PacketHeadSHA},
 	}
+	prRequest.ID = handler.retryableOperationID(request.Context(), approver.TenantID, prRequest.ID)
+	// Same resume discipline as the push above: this step can be interrupted
+	// between "GitHub created the PR" and "we recorded that it did", and a
+	// retry must then continue rather than re-submit into the replay guard.
 	prResult, err := handler.runChainOrReconcile(request.Context(), identity, approver, prRequest)
+	if err != nil && handler.alreadyPublished(request.Context(), approver.TenantID, prRequest.ID) {
+		prResult, err = handler.reconcileOnly(request.Context(), identity, prRequest.ID)
+	}
 	if err != nil {
 		handler.receiptFailure(request.Context(), approver.TenantID, id, "sync_publish_failed", "pull request: "+err.Error(), handler.now())
 		writeJSON(response, http.StatusBadGateway, map[string]any{"error": "sync_publish_failed", "stage": "pull_request.create", "detail": err.Error(), "state": "authorized"})
@@ -518,4 +554,62 @@ func (handler *SyncHumanHandler) close(response http.ResponseWriter, request *ht
 	// The queue must stop resurfacing a decision already made.
 	_ = handler.store.CompleteQueueItemForRef(request.Context(), approver.TenantID, "sync", id, handler.now())
 	writeJSON(response, http.StatusOK, map[string]any{"id": id, "state": "closed"})
+}
+
+// alreadyPublished reports whether an operation reached a POSITIVE terminal
+// state despite the chain returning an error.
+//
+// It exists because "the chain errored" and "the write did not happen" are
+// different claims, and conflating them stranded a completed push: the branch
+// was on GitHub, the operation later verified, and publication stopped anyway.
+// A reconcile that says verified is a positive witness; anything else is not,
+// so this fails closed and the caller reports the failure.
+func (handler *SyncHumanHandler) alreadyPublished(ctx context.Context, tenantID, operationID string) bool {
+	if handler.store == nil {
+		return false
+	}
+	operation, err := handler.store.Operation(ctx, tenantID, operationID)
+	if err != nil {
+		return false
+	}
+	return server.DurableState(operation.State) == server.DurableVerified
+}
+
+// retryableOperationID preserves replay protection for every operation that
+// may have executed, while giving a fresh identity to a terminal negative that
+// proves no public mutation occurred. This lets an already-reviewed pre-PR
+// recover after an internal policy defect is repaired without asking the human
+// to approve byte-identical content again.
+func (handler *SyncHumanHandler) retryableOperationID(ctx context.Context, tenantID, baseID string) string {
+	if handler.store == nil {
+		return baseID
+	}
+	for attempt := 0; attempt < 100; attempt++ {
+		candidate := baseID
+		if attempt > 0 {
+			candidate = fmt.Sprintf("%s-retry-%d", baseID, attempt)
+		}
+		operation, err := handler.store.Operation(ctx, tenantID, candidate)
+		if err != nil {
+			return candidate
+		}
+		state := server.DurableState(operation.State)
+		if state != server.DurableDenied && state != server.DurableAbsent {
+			return candidate
+		}
+	}
+	return baseID
+}
+
+// reconcileOnly returns the durable result for an operation that already ran,
+// without submitting anything. It is how the chain resumes past a step whose
+// work is complete: the resource id it carries (a PR number, a ref) is what the
+// following steps need, and re-submitting to obtain it would be denied by the
+// replay guard — correctly, since the write already happened.
+func (handler *SyncHumanHandler) reconcileOnly(ctx context.Context, identity server.DurableIdentity, operationID string) (server.DurableResult, error) {
+	reconciler, ok := handler.executor.(OperationReconciler)
+	if !ok {
+		return server.DurableResult{}, fmt.Errorf("cannot resume %s: no reconciler", operationID)
+	}
+	return reconciler.Reconcile(ctx, identity, operationID)
 }

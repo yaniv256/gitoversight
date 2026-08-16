@@ -47,6 +47,11 @@ func TestOpenMigratesAndEnforcesSafeRuntime(t *testing.T) {
 		"operation_packets", "approvals", "execution_grants", "reconciliations",
 		"audit_events", "audit_checkpoints", "notification_subscriptions",
 		"outbox_deliveries", "notification_deliveries", "webhook_receipts", "request_nonces",
+		"oauth_clients", "oauth_client_redirect_uris", "oauth_authorization_codes",
+		"oauth_authorization_code_repositories", "oauth_token_families",
+		"oauth_token_family_repositories", "oauth_access_tokens", "oauth_refresh_tokens",
+		"change_drafts",
+		"change_draft_publications",
 	}
 	for _, table := range wantTables {
 		if !hasTable(t, db, table) {

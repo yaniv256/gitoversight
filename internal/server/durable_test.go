@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/policy"
+	"github.com/yaniv256/gitoversight.dev/internal/releaseasset"
+	"github.com/yaniv256/gitoversight.dev/internal/storage"
 	"github.com/yaniv256/gitoversight.dev/internal/storage/sqlite"
 )
 
@@ -82,6 +84,92 @@ func TestDurableBrokerRejectsAmbiguousQualifiedRefBeforePersistence(t *testing.T
 	}
 	if _, err := broker.db.Operation(ctx, "tenant-a", "ambiguous-ref"); err == nil {
 		t.Fatal("rejected ambiguous ref was persisted")
+	}
+}
+
+func TestDurableBrokerPinsExactReadyReleaseAssetInSubmissionTransaction(t *testing.T) {
+	ctx := context.Background()
+	db := openDurableDB(t)
+	broker := newTestDurableBroker(db)
+	if err := broker.InstallPolicy(ctx, "tenant-a", durablePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.WithTx(ctx, func(tx *sqlite.Tx) error {
+		return tx.PutAgentCredential(ctx, storage.AgentCredential{
+			TenantID: "tenant-a", AgentID: "zara", ID: "zara-1",
+			PublicKey: make([]byte, 32), CreatedAt: now, ApprovedAt: now, ApprovedBy: "yaniv",
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stage := releaseasset.Stage{
+		TenantID: "tenant-a", ID: "0123456789abcdef0123456789abcdef",
+		AgentID: "zara", CredentialID: "zara-1", Repository: "yaniv256/private",
+		Name: "bridge.zip", ContentType: "application/zip", ExpectedSHA256: strings.Repeat("a", 64),
+		ExpectedSize: 42, ReservedSize: 42, State: releaseasset.StateCreated,
+		CapabilityHash: strings.Repeat("b", 64), CapabilityExpiresAt: now.Add(time.Minute),
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}
+	if err := broker.CreateStagedAsset(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithTx(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.BeginStagedAssetUpload(ctx, stage.TenantID, stage.ID, "temp", now.Add(time.Second)); err != nil {
+			return err
+		}
+		return tx.MarkStagedAssetReady(ctx, stage.TenantID, stage.ID, "object", now.Add(2*time.Second))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := DurableOperationRequest{
+		ID: "asset-operation", Repository: stage.Repository, Operation: "release.asset.upload",
+		ManifestHash: "asset-manifest", ApprovalID: "asset-approval", ApprovalNonce: "asset-nonce",
+		ApprovalExpiresAt: now.Add(30 * time.Minute), Approver: "yaniv", HeadSHA: "release-v1",
+		Payload: map[string]any{
+			"tag_name": "v1", "name": stage.Name, "content_type": stage.ContentType,
+			"asset": map[string]any{"stage_id": stage.ID, "sha256": stage.ExpectedSHA256, "size": float64(stage.ExpectedSize)},
+		},
+	}
+	result, err := broker.Submit(ctx, DurableIdentity{
+		TenantID: stage.TenantID, AgentID: stage.AgentID, CredentialID: stage.CredentialID,
+	}, request)
+	if err != nil || result.State != DurableAuthorized {
+		t.Fatalf("submit = %+v, %v", result, err)
+	}
+	pinned, err := db.StagedAssetForOwner(ctx, stage.TenantID, stage.ID, stage.AgentID, stage.CredentialID, stage.Repository)
+	if err != nil || pinned.State != releaseasset.StatePinned || pinned.OperationID != request.ID {
+		t.Fatalf("pinned = %+v, %v", pinned, err)
+	}
+
+	other := stage
+	other.ID = "fedcba9876543210fedcba9876543210"
+	other.CapabilityHash = strings.Repeat("c", 64)
+	if err := broker.CreateStagedAsset(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithTx(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.BeginStagedAssetUpload(ctx, other.TenantID, other.ID, "temp-2", now.Add(time.Second)); err != nil {
+			return err
+		}
+		return tx.MarkStagedAssetReady(ctx, other.TenantID, other.ID, "object-2", now.Add(2*time.Second))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.ID = "asset-mismatch"
+	request.ApprovalID = "asset-mismatch-approval"
+	request.ApprovalNonce = "asset-mismatch-nonce"
+	request.ManifestHash = "asset-mismatch-manifest"
+	request.HeadSHA = "release-v2"
+	request.Payload["asset"].(map[string]any)["stage_id"] = other.ID
+	request.Payload["asset"].(map[string]any)["size"] = float64(other.ExpectedSize + 1)
+	if _, err := broker.Submit(ctx, DurableIdentity{
+		TenantID: other.TenantID, AgentID: other.AgentID, CredentialID: other.CredentialID,
+	}, request); !errors.Is(err, ErrDurableInvalid) {
+		t.Fatalf("mismatch error = %v", err)
+	}
+	if _, err := db.Operation(ctx, other.TenantID, request.ID); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("mismatched operation persisted: %v", err)
 	}
 }
 
@@ -466,6 +554,30 @@ func TestDurableSubmitGrantsHumanOwnerActorForPrivateRepositoryCreate(t *testing
 	}
 	if public.State == DurableAuthorized || public.Decision != policy.ApprovalRequired {
 		t.Fatalf("public create must stay human-gated: %+v", public)
+	}
+}
+
+func TestDurableSubmitUsesEnrolledNamespaceOwnerForPrivateOwnerMutation(t *testing.T) {
+	ctx := context.Background()
+	broker := newTestDurableBroker(openDurableDB(t))
+	if err := broker.InstallPolicy(ctx, "tenant-a", durablePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	broker.SetHumanLogins(map[string]string{"yaniv": "yaniv256"})
+
+	result, err := broker.Submit(ctx, DurableIdentity{TenantID: "tenant-a", AgentID: "zara"}, DurableOperationRequest{
+		ID: "private-owner-push-1", Repository: "yaniv256/private", Operation: "branch.push",
+		Branch: "main", ManifestHash: "manifest-private", Payload: map[string]any{"sha": "abc123"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != DurableAuthorized || result.Decision != policy.Allowed {
+		t.Fatalf("private owner mutation = %+v", result)
+	}
+	stored, err := broker.db.Operation(ctx, "tenant-a", "private-owner-push-1")
+	if err != nil || stored.ActorMode != ActorHumanUser || stored.ActorSubject != "yaniv" {
+		t.Fatalf("stored actor = %q/%q, err = %v", stored.ActorMode, stored.ActorSubject, err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,12 +27,13 @@ const (
 )
 
 type ReadHandlerConfig struct {
-	Policy     policy.Snapshot
-	SessionTTL time.Duration
-	GitBaseURL string
-	GitProxy   http.Handler
-	Random     io.Reader
-	Now        func() time.Time
+	Policy         policy.Snapshot
+	PolicyResolver func(context.Context) (policy.Snapshot, error)
+	SessionTTL     time.Duration
+	GitBaseURL     string
+	GitProxy       http.Handler
+	Random         io.Reader
+	Now            func() time.Time
 }
 
 type readSession struct {
@@ -41,22 +43,25 @@ type readSession struct {
 }
 
 type ReadHandler struct {
-	policy     policy.Snapshot
-	ttl        time.Duration
-	gitBaseURL string
-	gitProxy   http.Handler
-	random     io.Reader
-	now        func() time.Time
-	mu         sync.Mutex
-	sessions   map[[sha256.Size]byte]readSession
+	policy         policy.Snapshot
+	policyResolver func(context.Context) (policy.Snapshot, error)
+	ttl            time.Duration
+	gitBaseURL     string
+	gitProxy       http.Handler
+	random         io.Reader
+	now            func() time.Time
+	mu             sync.Mutex
+	sessions       map[[sha256.Size]byte]readSession
 }
 
 func NewReadHandler(config ReadHandlerConfig) (*ReadHandler, error) {
 	if config.SessionTTL <= 0 || config.SessionTTL > time.Hour || strings.TrimSpace(config.GitBaseURL) == "" || config.GitProxy == nil {
 		return nil, errors.New("read handler configuration is incomplete")
 	}
-	if err := config.Policy.Validate(); err != nil {
-		return nil, err
+	if config.PolicyResolver == nil {
+		if err := config.Policy.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	if config.Random == nil {
 		config.Random = rand.Reader
@@ -65,7 +70,7 @@ func NewReadHandler(config ReadHandlerConfig) (*ReadHandler, error) {
 		config.Now = func() time.Time { return time.Now().UTC() }
 	}
 	return &ReadHandler{
-		policy: config.Policy, ttl: config.SessionTTL, gitBaseURL: strings.TrimRight(config.GitBaseURL, "/"),
+		policy: config.Policy, policyResolver: config.PolicyResolver, ttl: config.SessionTTL, gitBaseURL: strings.TrimRight(config.GitBaseURL, "/"),
 		gitProxy: config.GitProxy, random: config.Random, now: config.Now, sessions: make(map[[sha256.Size]byte]readSession),
 	}, nil
 }
@@ -96,7 +101,16 @@ func (handler *ReadHandler) create(response http.ResponseWriter, request *http.R
 		http.Error(response, "invalid read-session request", http.StatusBadRequest)
 		return
 	}
-	decision := policy.Evaluate(handler.policy, policy.Request{Caller: identity.AgentID, Repository: input.Repository, Operation: "repository.read"})
+	snapshot := handler.policy
+	if handler.policyResolver != nil {
+		var err error
+		snapshot, err = handler.policyResolver(request.Context())
+		if err != nil {
+			http.Error(response, "repository authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	decision := policy.Evaluate(snapshot, policy.Request{Caller: identity.AgentID, Repository: input.Repository, Operation: "repository.read"})
 	if decision.Code != policy.AllowedRead {
 		http.Error(response, "repository read denied", http.StatusForbidden)
 		return

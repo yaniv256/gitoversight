@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/yaniv256/gitoversight.dev/internal/releaseasset"
 	"github.com/yaniv256/gitoversight.dev/internal/worker"
 )
 
@@ -21,10 +22,15 @@ type mutationAPI interface {
 
 type Executor struct {
 	client pullRequestAPI
+	blobs  releaseasset.BlobReader
 }
 
 func NewExecutor(client pullRequestAPI) *Executor {
 	return &Executor{client: client}
+}
+
+func NewExecutorWithBlobReader(client pullRequestAPI, blobs releaseasset.BlobReader) *Executor {
+	return &Executor{client: client, blobs: blobs}
 }
 
 func (e *Executor) Execute(request worker.Request) (worker.Result, error) {
@@ -36,6 +42,41 @@ func (e *Executor) Execute(request worker.Request) (worker.Result, error) {
 		client, ok := e.client.(mutationAPI)
 		if !ok {
 			return worker.Result{}, errors.New("operation has no privileged executor")
+		}
+		if request.Operation == "release.asset.upload" {
+			staged, descriptor, err := releaseAssetDescriptor(request.Payload)
+			if err != nil {
+				return worker.Result{}, err
+			}
+			if staged {
+				streamer, ok := e.client.(interface {
+					ExecuteReleaseAsset(worker.Request, TokenMode, string, releaseasset.BlobReader, releaseAssetPacketState) (worker.ReleaseAssetWitness, error)
+				})
+				if !ok || e.blobs == nil {
+					return worker.Result{}, errors.New("streamed release asset executor is unavailable")
+				}
+				witness, err := streamer.ExecuteReleaseAsset(request, mode, subject, e.blobs, descriptor)
+				return worker.Result{ResourceID: witness.ResourceID, AssetWitness: &witness}, err
+			}
+		} else if request.Operation == "release.assets.upload" {
+			descriptors, err := releaseAssetDescriptors(request.Payload)
+			if err != nil {
+				return worker.Result{}, err
+			}
+			streamer, ok := e.client.(interface {
+				ExecuteReleaseAsset(worker.Request, TokenMode, string, releaseasset.BlobReader, releaseAssetPacketState) (worker.ReleaseAssetWitness, error)
+			})
+			if !ok || e.blobs == nil {
+				return worker.Result{}, errors.New("streamed release asset executor is unavailable")
+			}
+			var last worker.ReleaseAssetWitness
+			for _, descriptor := range descriptors {
+				last, err = streamer.ExecuteReleaseAsset(request, mode, subject, e.blobs, descriptor)
+				if err != nil {
+					return worker.Result{ResourceID: last.ResourceID}, err
+				}
+			}
+			return worker.Result{ResourceID: last.ResourceID, AssetWitness: &last}, nil
 		}
 		resourceID, err := client.ExecuteMutation(request, mode, subject)
 		return worker.Result{ResourceID: resourceID}, err

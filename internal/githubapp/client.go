@@ -2,6 +2,8 @@ package githubapp
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -295,6 +297,113 @@ func (c *Client) callAbsolute(method, rawURL string, mode TokenMode, subject, co
 		return nil, errors.New("github response exceeds bound")
 	}
 	return result, nil
+}
+
+// streamReleaseAsset sends raw bytes with an exact length and a bounded JSON
+// response. Redirects are rejected so installation authorization can never be
+// replayed to an upload host GitHub did not name in the governed release URL.
+func (c *Client) streamReleaseAsset(rawURL string, mode TokenMode, subject string, asset releaseAssetPacketState, source io.Reader) (releaseAssetState, int64, string, error) {
+	token, err := c.tokens(mode, subject)
+	if err != nil {
+		return releaseAssetState{}, 0, "", errors.New("token provider failed")
+	}
+	hashing := &hashingReader{source: source, hash: sha256.New()}
+	request, err := http.NewRequest(http.MethodPost, rawURL, hashing)
+	if err != nil {
+		return releaseAssetState{}, 0, "", err
+	}
+	request.ContentLength = asset.Size
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Content-Type", asset.ContentType)
+	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	request.Header.Set("User-Agent", "gitoversight-broker")
+	httpClient := *c.http
+	// The configured client timeout is appropriate for bounded JSON API calls,
+	// but a whole-request timeout makes uploadability depend on bandwidth. The
+	// transport still enforces connect/TLS/response-header timeouts; the exact
+	// length reader and worker RPC lifecycle bound the body stream itself.
+	httpClient.Timeout = 0
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return releaseAssetState{}, hashing.count, hex.EncodeToString(hashing.hash.Sum(nil)), errors.New("github release asset upload outcome indeterminate")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		return releaseAssetState{}, hashing.count, hex.EncodeToString(hashing.hash.Sum(nil)), fmt.Errorf("github returned status %d for release asset upload; outcome requires reconciliation", response.StatusCode)
+	}
+	var result releaseAssetState
+	if err := json.NewDecoder(io.LimitReader(response.Body, defaultRawResponseCap)).Decode(&result); err != nil {
+		return releaseAssetState{}, hashing.count, hex.EncodeToString(hashing.hash.Sum(nil)), errors.New("github release asset response decode failed; outcome indeterminate")
+	}
+	return result, hashing.count, hex.EncodeToString(hashing.hash.Sum(nil)), nil
+}
+
+// hashReleaseAssetDownload streams a reconciliation candidate into a digest.
+// The API request is authenticated, but any redirect is followed by a fresh
+// request with no Authorization header, preventing installation-token leakage
+// to GitHub's object-storage hosts.
+func (c *Client) hashReleaseAssetDownload(rawURL string, mode TokenMode, subject string, expectedSize int64) (int64, string, error) {
+	token, err := c.tokens(mode, subject)
+	if err != nil {
+		return 0, "", errors.New("token provider failed")
+	}
+	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/octet-stream")
+	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	request.Header.Set("User-Agent", "gitoversight-broker")
+	noRedirect := *c.http
+	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := noRedirect.Do(request)
+	if err != nil {
+		return 0, "", errors.New("github release asset reconciliation failed")
+	}
+	if response.StatusCode >= 300 && response.StatusCode < 400 {
+		location, locationErr := response.Location()
+		response.Body.Close()
+		if locationErr != nil || location.Scheme != "https" && location.Scheme != "http" {
+			return 0, "", errors.New("github release asset redirect is invalid")
+		}
+		redirectRequest, requestErr := http.NewRequest(http.MethodGet, location.String(), nil)
+		if requestErr != nil {
+			return 0, "", requestErr
+		}
+		redirectRequest.Header.Set("Accept", "application/octet-stream")
+		redirectRequest.Header.Set("User-Agent", "gitoversight-broker")
+		response, err = c.http.Do(redirectRequest)
+		if err != nil {
+			return 0, "", errors.New("github release asset redirected download failed")
+		}
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		return 0, "", fmt.Errorf("github returned status %d for release asset download", response.StatusCode)
+	}
+	hash := sha256.New()
+	count, err := io.CopyN(hash, response.Body, expectedSize)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return count, "", errors.New("github release asset download failed")
+	}
+	var extra [1]byte
+	n, readErr := response.Body.Read(extra[:])
+	if n != 0 || readErr != nil && !errors.Is(readErr, io.EOF) {
+		if n > 0 {
+			count += int64(n)
+		}
+		return count, hex.EncodeToString(hash.Sum(nil)), nil
+	}
+	return count, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (c *Client) call(method, path string, mode TokenMode, subject string, body io.Reader, result any) error {

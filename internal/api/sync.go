@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,11 +10,10 @@ import (
 	"time"
 
 	"github.com/yaniv256/gitoversight.dev/internal/agentauth"
+	"github.com/yaniv256/gitoversight.dev/internal/brokerapp"
 	"github.com/yaniv256/gitoversight.dev/internal/commitpacket"
 	"github.com/yaniv256/gitoversight.dev/internal/policy"
-	"github.com/yaniv256/gitoversight.dev/internal/prpreview"
 	"github.com/yaniv256/gitoversight.dev/internal/storage/sqlite"
-	"github.com/yaniv256/gitoversight.dev/internal/workerrpc"
 )
 
 type SyncHandlerConfig struct {
@@ -28,20 +28,19 @@ type SyncHandlerConfig struct {
 	Bases BaseReader
 	// BaseBranch is the public branch a pre-PR is measured against.
 	BaseBranch string
+	// Proposals lets multiple transports share one application service.
+	Proposals *brokerapp.SyncProposalService
 }
 
 // BaseReader is the worker-side public-repository read the propose path needs.
-type BaseReader interface {
-	ReadBase(workerrpc.BaseReadRequest) (workerrpc.BaseRead, error)
-}
+type BaseReader = brokerapp.SyncProposalBaseReader
 
 type SyncHandler struct {
-	policy     policy.Snapshot
-	store      *sqlite.DB
-	maxBody    int64
-	now        func() time.Time
-	bases      BaseReader
-	baseBranch string
+	policy    policy.Snapshot
+	store     *sqlite.DB
+	maxBody   int64
+	now       func() time.Time
+	proposals *brokerapp.SyncProposalService
 }
 
 func NewSyncHandler(config SyncHandlerConfig) *SyncHandler {
@@ -54,8 +53,49 @@ func NewSyncHandler(config SyncHandlerConfig) *SyncHandler {
 	if config.BaseBranch == "" {
 		config.BaseBranch = "main"
 	}
-	return &SyncHandler{policy: config.Policy, store: config.Store, maxBody: config.MaxBodyBytes, now: config.Now,
-		bases: config.Bases, baseBranch: config.BaseBranch}
+	proposals := config.Proposals
+	if proposals == nil {
+		proposals = NewSyncProposalApplication(config.Policy, config.Store, config.Bases, config.BaseBranch, config.Now)
+	}
+	return &SyncHandler{
+		policy: config.Policy, store: config.Store, maxBody: config.MaxBodyBytes, now: config.Now,
+		proposals: proposals,
+	}
+}
+
+// NewSyncProposalApplication constructs the shared private-mirror pre-PR
+// service used by both the signed HTTP API and the remote MCP adapter.
+func NewSyncProposalApplication(snapshot policy.Snapshot, db *sqlite.DB, bases BaseReader, baseBranch string, now func() time.Time, policies ...brokerapp.SyncProposalPolicySource) *brokerapp.SyncProposalService {
+	var store brokerapp.SyncProposalStore
+	if db != nil {
+		store = sqliteSyncProposalStore{db: db}
+	}
+	var source brokerapp.SyncProposalPolicySource
+	if len(policies) > 0 {
+		source = policies[0]
+	}
+	return brokerapp.NewSyncProposalService(brokerapp.SyncProposalConfig{
+		Policy: snapshot, Policies: source, Store: store, Bases: bases, BaseBranch: baseBranch, Now: now,
+	})
+}
+
+type sqliteSyncProposalStore struct{ db *sqlite.DB }
+
+func (store sqliteSyncProposalStore) CreateSyncProposal(ctx context.Context, record brokerapp.SyncProposalRecord, notifyAgent string, now time.Time) error {
+	err := store.db.CreateSyncProposal(ctx, sqlite.SyncRequest{
+		TenantID: record.TenantID, ID: record.ID,
+		PrivateRepository: record.PrivateRepository, PublicRepository: record.PublicRepository,
+		ProposalText: record.ProposalText, FileManifest: record.FileManifest,
+		CommitPacketJSON: record.CommitPacketJSON, PacketHeadSHA: record.PacketHeadSHA,
+		CreatedBy: record.CreatedBy,
+	}, notifyAgent, now)
+	if sqlite.IsUniqueViolation(err) {
+		return brokerapp.ErrSyncProposalExists
+	}
+	if err != nil {
+		return errors.Join(brokerapp.ErrSyncProposalRejected, err)
+	}
+	return nil
 }
 
 // rebaseAgainstPublicBase turns a submitted shape into the pre-PR that will be
@@ -67,73 +107,7 @@ func NewSyncHandler(config SyncHandlerConfig) *SyncHandler {
 // its own file list — anything the human's approval binds is computed by the
 // party doing the binding.
 func (handler *SyncHandler) rebaseAgainstPublicBase(target, packetJSON string) (string, []string, error) {
-	if handler.bases == nil {
-		return "", nil, errors.New("public base resolution is unavailable")
-	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(packetJSON), &raw); err != nil {
-		return "", nil, errors.New("commit packet is not JSON")
-	}
-	packet, present, err := commitpacket.Decode(raw)
-	if err != nil || !present {
-		return "", nil, errors.New("commit packet is invalid")
-	}
-	base, err := handler.bases.ReadBase(workerrpc.BaseReadRequest{Repository: target, Branch: handler.baseBranch})
-	if err != nil {
-		return "", nil, err
-	}
-	rebased, err := prpreview.Rebase(base.Entries, base.TreeSHA, base.CommitSHA, packet.Tree.Entries, packet.Blobs)
-	if err != nil {
-		return "", nil, err
-	}
-	packet.Tree.Entries = rebased.Entries
-	packet.Tree.BaseTree = rebased.BaseTreeSHA
-	packet.Blobs = rebased.Blobs
-	// The published commit must also be PARENTED on the public HEAD, not merely
-	// have its contents rebased onto it. These are two different claims and
-	// conflating them shipped a broken PR: the reviewed diff was correct
-	// against ee92d91, but the commit kept its private parent da9dfab, so
-	// GitHub computed the merge from a stale merge-base and reported conflicts
-	// on three files (PR #9, 2026-07-26).
-	//
-	// A pre-PR promises "this is what merging produces". A commit whose ancestry
-	// predates the base cannot keep that promise however correct its tree is.
-	if rebased.BaseCommitSHA != "" {
-		packet.Reparent(rebased.BaseCommitSHA)
-	} else {
-		// An empty public repository has no HEAD to parent on: the first commit
-		// is a root commit.
-		packet.Reparent()
-	}
-	// Re-validate what will actually be STORED. The submitted shape was
-	// validated on the way in, but rebasing rewrites entries, blobs, and
-	// base_tree — so validity of the input says nothing about validity of the
-	// output. Without this, a malformed rebased packet is accepted here,
-	// rendered on the review page, APPROVED BY A HUMAN, and only then rejected
-	// at publish: the worst possible moment to discover it.
-	if err := packet.Validate(); err != nil {
-		return "", nil, fmt.Errorf("rebased packet is invalid: %w", err)
-	}
-	raw["object_package"] = packet
-	// The envelope's `sha` must follow the commit it describes. Reparent above
-	// rewrites the commit SHA — a reparented commit is a DIFFERENT commit — so
-	// leaving the submitted value here strands the envelope one commit behind
-	// the package it wraps.
-	//
-	// Nothing on the review path reads `sha`, so the divergence is invisible
-	// right up to the last step: validateExecutableOperation requires
-	// packet.Commit.SHA == payload["sha"] before it will persist a branch.push.
-	// It fails AFTER the human approves, and because the operation is rejected
-	// before insertion, the retry's reconcile finds no row and reports "durable
-	// operation not found" — an error describing the recovery attempt rather
-	// than the cause. Observed live 2026-07-27: envelope c160200d, commit
-	// c2cd22e1, publication refused with nothing written to GitHub.
-	raw["sha"] = packet.Commit.SHA
-	rebasedJSON, err := json.Marshal(raw)
-	if err != nil {
-		return "", nil, err
-	}
-	return string(rebasedJSON), rebased.Manifest, nil
+	return handler.proposals.Rebase(target, packetJSON)
 }
 
 // Files is ACCEPTED AND DISCARDED, deliberately. It is a compatibility shim,
@@ -224,43 +198,30 @@ func (handler *SyncHandler) propose(response http.ResponseWriter, request *http.
 		writeError(response, http.StatusBadRequest, "invalid_sync_input")
 		return
 	}
-	decision := policy.Evaluate(handler.policy, policy.Request{Caller: identity.AgentID, Repository: input.Repository, Operation: "sync.propose"})
-	if decision.Code != policy.Allowed {
-		writeJSON(response, http.StatusForbidden, map[string]any{"error": string(decision.Code), "reason": decision.Reason})
-		return
-	}
-	target := handler.policy.Repositories[input.Repository].SyncsTo
-	// The submitted shape is re-expressed as the diff from the PUBLIC repo's
-	// current HEAD, and the reviewed file list is derived from that diff. The
-	// agent's own `files` field is discarded: it was never checked against the
-	// packet, so a proposal could declare one path and publish twenty.
-	packetJSON, manifest, err := handler.rebaseAgainstPublicBase(target, input.CommitPacketJSON)
+	result, err := handler.proposals.Propose(request.Context(), brokerapp.Identity{
+		TenantID: identity.TenantID, AgentID: identity.AgentID, CredentialID: identity.CredentialID,
+	}, brokerapp.SyncProposalRequest{
+		ID: input.ID, Repository: input.Repository, Text: input.Text,
+		CommitPacketJSON: input.CommitPacketJSON, PacketHeadSHA: input.PacketHeadSHA,
+	})
 	if err != nil {
-		writeJSON(response, http.StatusUnprocessableEntity, map[string]any{"error": "sync_rebase_failed", "reason": err.Error()})
-		return
-	}
-	now := handler.now()
-	req := sqlite.SyncRequest{
-		TenantID: identity.TenantID, ID: input.ID,
-		PrivateRepository: input.Repository, PublicRepository: target,
-		ProposalText: input.Text, FileManifest: manifest,
-		// PacketHeadSHA names the commit that will be PUBLISHED, which after a
-		// reparent is not the one the client submitted. Storing input's value
-		// sends a stale head_sha to both branch.push and pull_request.create —
-		// a PR opened against a commit that was never pushed.
-		CommitPacketJSON: packetJSON, PacketHeadSHA: rebasedHeadSHA(packetJSON, input.PacketHeadSHA),
-		CreatedBy: identity.AgentID,
-	}
-	if err := handler.store.CreateSyncProposal(request.Context(), req, handler.policy.QueueCurator, now); err != nil {
-		if sqlite.IsUniqueViolation(err) {
+		var denied brokerapp.SyncProposalPolicyError
+		switch {
+		case errors.As(err, &denied):
+			writeJSON(response, http.StatusForbidden, map[string]any{"error": string(denied.Code), "reason": denied.Reason})
+		case errors.Is(err, brokerapp.ErrSyncProposalRebase):
+			writeJSON(response, http.StatusUnprocessableEntity, map[string]any{"error": "sync_rebase_failed", "reason": err.Error()})
+		case errors.Is(err, brokerapp.ErrSyncProposalExists):
 			writeError(response, http.StatusConflict, "sync_exists")
-			return
+		default:
+			writeError(response, http.StatusUnprocessableEntity, "sync_rejected")
 		}
-		writeError(response, http.StatusUnprocessableEntity, "sync_rejected")
 		return
 	}
-	hash := sqlite.SyncProposalHash(input.Text, manifest, input.PacketHeadSHA, packetJSON)
-	writeJSON(response, http.StatusCreated, map[string]any{"id": input.ID, "state": "proposed", "proposal_hash": hash, "public_repository": target, "files": manifest})
+	writeJSON(response, http.StatusCreated, map[string]any{
+		"id": result.ID, "state": result.State, "proposal_hash": result.ProposalHash,
+		"public_repository": result.PublicRepository, "files": result.Files,
+	})
 }
 
 func (handler *SyncHandler) update(response http.ResponseWriter, request *http.Request, identity agentauth.Identity, id string) {

@@ -45,6 +45,28 @@ func (unavailableRunner) Reconcile(worker.Request) (worker.Result, error) {
 	return worker.Result{}, context.DeadlineExceeded
 }
 
+type testExecutionActivities struct {
+	active map[string]int
+	block  bool
+}
+
+func newTestExecutionActivities() *testExecutionActivities {
+	return &testExecutionActivities{active: map[string]int{}}
+}
+
+func (activities *testExecutionActivities) BeginMaintenanceActivity(_ context.Context, kind string, _ time.Time) error {
+	if activities.block {
+		return context.Canceled
+	}
+	activities.active[kind]++
+	return nil
+}
+
+func (activities *testExecutionActivities) EndMaintenanceActivity(_ context.Context, kind string, _ time.Time) error {
+	activities.active[kind]--
+	return nil
+}
+
 type directAuthority struct {
 	broker   *server.DurableBroker
 	workerID string
@@ -93,13 +115,48 @@ func TestExecutionCoordinatorIssuesOneGrantAndReturnsTerminalState(t *testing.T)
 		t.Fatal(err)
 	}
 	github := &committedExecutor{}
-	coordinator := NewExecutionCoordinator(broker, localRunner{worker: worker.New(broker, github)}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute})
+	activities := newTestExecutionActivities()
+	coordinator := NewExecutionCoordinator(broker, localRunner{worker: worker.New(broker, github)}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute, ActivityStore: activities})
 	result, err := coordinator.Execute(ctx, server.DurableIdentity{TenantID: "tenant-a", AgentID: "zara"}, request.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.State != server.DurableVerified || result.ResourceID != "verified-pr-42" || github.calls != 1 {
 		t.Fatalf("result = %+v, GitHub calls = %d", result, github.calls)
+	}
+	if activities.active["execution"] != 0 {
+		t.Fatalf("execution activity leaked: %v", activities.active)
+	}
+}
+
+func TestExecutionCoordinatorRejectsExecutionAndReconciliationWhenBarrierBlocksActivity(t *testing.T) {
+	ctx := context.Background()
+	broker := operationTestBroker(t)
+	broker.SetWriteGate(readyWriteGate{})
+	request := server.DurableOperationRequest{
+		ID: "blocked-1", Repository: "yaniv256/private", Operation: "pull_request.create",
+		Branch: "feat/blocked", Title: "Private", Body: "Body", ManifestHash: "manifest",
+		Payload: map[string]any{"base": "dev", "head_sha": "abc123"},
+	}
+	identity := server.DurableIdentity{TenantID: "tenant-a", AgentID: "zara"}
+	if _, err := broker.Submit(ctx, identity, request); err != nil {
+		t.Fatal(err)
+	}
+	activities := newTestExecutionActivities()
+	activities.block = true
+	github := &committedExecutor{}
+	coordinator := NewExecutionCoordinator(
+		broker, localRunner{worker: worker.New(broker, github)},
+		ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute, ActivityStore: activities},
+	)
+	if _, err := coordinator.Execute(ctx, identity, request.ID); err == nil {
+		t.Fatal("execution succeeded while activity acquisition was blocked")
+	}
+	if _, err := coordinator.Reconcile(ctx, identity, request.ID); err == nil {
+		t.Fatal("reconciliation succeeded while activity acquisition was blocked")
+	}
+	if github.calls != 0 {
+		t.Fatalf("privileged runner calls = %d, want 0", github.calls)
 	}
 }
 
@@ -111,13 +168,14 @@ func TestExecutionCoordinatorAllowsRetryOnlyWhenWorkerNeverConsumedGrant(t *test
 	if _, err := broker.Submit(ctx, server.DurableIdentity{TenantID: "tenant-a", AgentID: "zara"}, request); err != nil {
 		t.Fatal(err)
 	}
-	failed := NewExecutionCoordinator(broker, unavailableRunner{}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute})
+	activities := newTestExecutionActivities()
+	failed := NewExecutionCoordinator(broker, unavailableRunner{}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute, ActivityStore: activities})
 	status, err := failed.Execute(ctx, server.DurableIdentity{TenantID: "tenant-a", AgentID: "zara"}, request.ID)
 	if err == nil || status.State != server.DurableAuthorized {
 		t.Fatalf("failed delivery status = %+v, err = %v", status, err)
 	}
 	github := &committedExecutor{}
-	retry := NewExecutionCoordinator(broker, localRunner{worker: worker.New(broker, github)}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute})
+	retry := NewExecutionCoordinator(broker, localRunner{worker: worker.New(broker, github)}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute, ActivityStore: activities})
 	status, err = retry.Execute(ctx, server.DurableIdentity{TenantID: "tenant-a", AgentID: "zara"}, request.ID)
 	if err != nil || status.State != server.DurableVerified || github.calls != 1 {
 		t.Fatalf("retry status = %+v, calls = %d, err = %v", status, github.calls, err)
@@ -135,7 +193,8 @@ func TestExecutionCoordinatorLaterReconcilesWithoutRepeatingMutation(t *testing.
 	}
 	executor := &laterCommittedExecutor{}
 	authority := directAuthority{broker: broker, workerID: "worker-a"}
-	coordinator := NewExecutionCoordinator(broker, localRunner{worker: worker.New(authority, executor)}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute})
+	activities := newTestExecutionActivities()
+	coordinator := NewExecutionCoordinator(broker, localRunner{worker: worker.New(authority, executor)}, ExecutionCoordinatorConfig{WorkerID: "worker-a", GrantTTL: time.Minute, ActivityStore: activities})
 	result, err := coordinator.Execute(ctx, identity, request.ID)
 	if err == nil || result.State != server.DurableIndeterminate || executor.executions != 1 {
 		t.Fatalf("initial result = %+v, executions = %d, err = %v", result, executor.executions, err)
@@ -143,5 +202,8 @@ func TestExecutionCoordinatorLaterReconcilesWithoutRepeatingMutation(t *testing.
 	result, err = coordinator.Reconcile(ctx, identity, request.ID)
 	if err != nil || result.State != server.DurableVerified || result.ResourceID != "verified-later-pr-42" || executor.executions != 1 || executor.reconciliations != 2 {
 		t.Fatalf("later result = %+v, executions = %d, reconciliations = %d, err = %v", result, executor.executions, executor.reconciliations, err)
+	}
+	if activities.active["execution"] != 0 || activities.active["reconciliation"] != 0 {
+		t.Fatalf("execution activities leaked: %v", activities.active)
 	}
 }

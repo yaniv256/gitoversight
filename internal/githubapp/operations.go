@@ -2,11 +2,15 @@ package githubapp
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -16,6 +20,7 @@ import (
 
 	"github.com/yaniv256/gitoversight.dev/internal/commitpacket"
 	"github.com/yaniv256/gitoversight.dev/internal/gitref"
+	"github.com/yaniv256/gitoversight.dev/internal/releaseasset"
 	"github.com/yaniv256/gitoversight.dev/internal/worker"
 )
 
@@ -139,8 +144,21 @@ func (c *Client) ExecuteMutation(request worker.Request, mode TokenMode, subject
 			if bootErr != nil {
 				return "", fmt.Errorf("empty repository bootstrap failed: %w", bootErr)
 			}
-			if err := c.publishCommitObjects(request.Repository, mode, subject, packet); err != nil {
-				return "", err
+			// GitHub can acknowledge the contents-API bootstrap before its git-data
+			// endpoints observe the new repository history. Blob publication is
+			// content-addressed and therefore safe to retry; wait through that narrow
+			// propagation window instead of leaving the bootstrap marker as the only
+			// commit and falsely reporting the governed first push as absent.
+			var publishErr error
+			for attempt := 0; attempt < 5; attempt++ {
+				publishErr = c.publishCommitObjects(request.Repository, mode, subject, packet)
+				if !errors.Is(publishErr, ErrGitHubRepositoryEmpty) {
+					break
+				}
+				c.sleep(time.Duration(pow3(attempt)) * time.Second)
+			}
+			if publishErr != nil {
+				return "", publishErr
 			}
 			var current gitReference
 			if err := c.call(http.MethodGet, refPath, mode, subject, nil, &current); err != nil {
@@ -328,7 +346,7 @@ func (c *Client) ExecuteMutation(request worker.Request, mode TokenMode, subject
 		}
 		return releaseResource(result), nil
 	case "release.asset.upload":
-		asset, content, err := releaseAssetPacket(request.Payload)
+		asset, content, err := legacyReleaseAssetPacket(request.Payload)
 		if err != nil {
 			return "", err
 		}
@@ -411,6 +429,96 @@ func (c *Client) ExecuteMutation(request worker.Request, mode TokenMode, subject
 	}
 }
 
+// ExecuteReleaseAsset is the descriptor-only release path. It opens bytes by
+// tenant/stage binding, preflights the immutable descriptor completely, rewinds
+// that same descriptor, and only then starts the GitHub request.
+func (c *Client) ExecuteReleaseAsset(request worker.Request, mode TokenMode, subject string, blobs releaseasset.BlobReader, asset releaseAssetPacketState) (worker.ReleaseAssetWitness, error) {
+	if blobs == nil {
+		return worker.ReleaseAssetWitness{}, errors.New("streamed release asset reader is unavailable")
+	}
+	if err := c.requireActor(request, mode, subject); err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	if err := c.requirePullRequestIsWritable(request, mode, subject); err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	subject = scopedSubject(mode, subject, request.Repository, request.Operation)
+	source, err := blobs.Open(context.Background(), request.TenantID, asset.StageID, asset.Size, asset.SHA256)
+	if err != nil {
+		return worker.ReleaseAssetWitness{}, fmt.Errorf("staged release asset unavailable or corrupt: %w", err)
+	}
+	defer source.Close()
+	if err := verifyAndRewind(source, asset.Size, asset.SHA256); err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	var release releaseState
+	if err := c.call(http.MethodGet, "/repos/"+request.Repository+"/releases/tags/"+url.PathEscape(asset.TagName), mode, subject, nil, &release); err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	uploadURL, err := c.releaseUploadURL(release.UploadURL, asset.Name)
+	if err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	result, sentSize, sentDigest, err := c.streamReleaseAsset(uploadURL, mode, subject, asset, source)
+	if err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	if sentSize != asset.Size || sentDigest != asset.SHA256 {
+		return worker.ReleaseAssetWitness{}, errors.New("staged release asset changed while streaming; github outcome indeterminate")
+	}
+	if err := validateReleaseAssetWitness(result, asset); err != nil {
+		return worker.ReleaseAssetWitness{}, err
+	}
+	resourceID := releaseAssetResource(result)
+	return worker.ReleaseAssetWitness{
+		ID: result.ID, Name: result.Name, Size: result.Size, ContentType: result.ContentType,
+		State: result.State, Digest: result.Digest, ResourceID: resourceID,
+	}, nil
+}
+
+func verifyAndRewind(source releaseasset.ReadSeekCloser, expectedSize int64, expectedSHA string) error {
+	hash := sha256.New()
+	count, err := io.Copy(hash, source)
+	if err != nil || count != expectedSize || hex.EncodeToString(hash.Sum(nil)) != expectedSHA {
+		return errors.New("staged release asset preflight integrity mismatch")
+	}
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return errors.New("staged release asset cannot preserve descriptor identity")
+	}
+	return nil
+}
+
+type hashingReader struct {
+	source io.Reader
+	hash   hash.Hash
+	count  int64
+}
+
+func (r *hashingReader) Read(payload []byte) (int, error) {
+	n, err := r.source.Read(payload)
+	if n > 0 {
+		_, _ = r.hash.Write(payload[:n])
+		r.count += int64(n)
+	}
+	return n, err
+}
+
+func validateReleaseAssetWitness(result releaseAssetState, asset releaseAssetPacketState) error {
+	if result.ID <= 0 || result.Name != asset.Name || result.Size != asset.Size {
+		return errors.New("github release asset response did not match approved descriptor")
+	}
+	// GitHub may normalize the upload Content-Type based on the filename. The
+	// approved value still controls the outbound request header, while the
+	// immutable witness is bound by name, exact size, and SHA-256.
+	if result.State != "" && result.State != "uploaded" {
+		return errors.New("github release asset response was not uploaded")
+	}
+	if result.Digest != "" && result.Digest != "sha256:"+asset.SHA256 {
+		return errors.New("github release asset response digest did not match approved descriptor")
+	}
+	return nil
+}
+
 // bootstrapEmptyRepository mints a root commit on a commitless repository via
 // the contents API (the only write surface GitHub allows before the first
 // commit), returning the bootstrap commit's sha. This initializes the git
@@ -456,6 +564,23 @@ func secondaryRateLimited(err error) bool {
 const blobUploadAttempts = 5
 
 func (c *Client) publishCommitObjects(repository string, mode TokenMode, subject string, packet commitpacket.Packet) error {
+	// A commit packet may describe objects relative to commits or trees that
+	// exist only in the caller's local repository. GitHub accepts object writes
+	// one at a time, so discovering that only after uploading every blob is both
+	// expensive and misleading. Prove all immutable prerequisites exist in the
+	// destination before sending any packet bytes.
+	for _, parent := range packet.Commit.Parents {
+		var object gitObject
+		if err := c.call(http.MethodGet, "/repos/"+repository+"/git/commits/"+parent, mode, subject, nil, &object); err != nil {
+			return fmt.Errorf("commit packet parent %s is unavailable in the destination repository; publish that parent first or rebuild onto a published base: %w", parent, err)
+		}
+	}
+	if packet.Tree.BaseTree != "" {
+		var object gitObject
+		if err := c.call(http.MethodGet, "/repos/"+repository+"/git/trees/"+packet.Tree.BaseTree, mode, subject, nil, &object); err != nil {
+			return fmt.Errorf("commit packet base tree %s is unavailable in the destination repository; publish its commit first or build a complete tree: %w", packet.Tree.BaseTree, err)
+		}
+	}
 	// Blobs upload one request at a time, so a large publication is a burst:
 	// 302 files in the first public sync of this repository tripped GitHub's
 	// secondary rate limit partway through (2026-07-27). The loop had no
@@ -560,7 +685,11 @@ func (c *Client) ReconcileMutation(request worker.Request, mode TokenMode, subje
 		}
 		var result gitReference
 		if err := c.call(http.MethodGet, referencePath(request.Repository, branch), mode, subject, nil, &result); err != nil {
-			if errors.Is(err, ErrGitHubNotFound) {
+			// GitHub returns 409 rather than 404 when the repository exists but has
+			// no commits. For a branch.push reconciliation both responses prove the
+			// requested ref is absent; treating the empty-repository response as
+			// unknown wedges the exact first-push request forever.
+			if errors.Is(err, ErrGitHubNotFound) || errors.Is(err, ErrGitHubRepositoryEmpty) {
 				return worker.Reconciliation{State: worker.ReconciliationAbsent}, nil
 			}
 			return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
@@ -700,36 +829,41 @@ func (c *Client) ReconcileMutation(request worker.Request, mode TokenMode, subje
 		matches := !result.Draft && result.Prerelease == prerelease && result.TagName == tag && result.TargetCommitish == target && result.Name == request.Title && result.Body == request.Body
 		return presence(matches, releaseResource(result)), nil
 	case "release.asset.upload":
-		asset, _, err := releaseAssetPacket(request.Payload)
+		staged, asset, err := releaseAssetDescriptor(request.Payload)
+		if err == nil && !staged {
+			asset, _, err = legacyReleaseAssetPacket(request.Payload)
+		}
 		if err != nil {
 			return unknown(err.Error())
 		}
-		var release releaseState
-		if err := c.call(http.MethodGet, "/repos/"+request.Repository+"/releases/tags/"+url.PathEscape(asset.TagName), mode, subject, nil, &release); err != nil {
-			if errors.Is(err, ErrGitHubNotFound) {
-				return worker.Reconciliation{State: worker.ReconciliationAbsent}, nil
-			}
-			return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
+		return c.reconcileReleaseAsset(request.Repository, asset, mode, subject)
+	case "release.assets.upload":
+		assets, err := releaseAssetDescriptors(request.Payload)
+		if err != nil {
+			return unknown(err.Error())
 		}
-		for _, candidate := range release.Assets {
-			if candidate.Name != asset.Name || candidate.Size != asset.Size {
-				continue
+		committed, absent := 0, 0
+		var resourceID string
+		for _, asset := range assets {
+			result, reconcileErr := c.reconcileReleaseAsset(request.Repository, asset, mode, subject)
+			if reconcileErr != nil || result.State == worker.ReconciliationUnknown {
+				return worker.Reconciliation{State: worker.ReconciliationUnknown}, reconcileErr
 			}
-			downloadURL, err := c.releaseAssetURL(candidate.URL)
-			if err != nil {
-				return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
+			switch result.State {
+			case worker.ReconciliationCommitted:
+				committed++
+				resourceID = result.ResourceID
+			case worker.ReconciliationAbsent:
+				absent++
 			}
-			content, err := c.callAbsolute(http.MethodGet, downloadURL, mode, subject, "", nil, maxReleaseAssetBytes)
-			if err != nil {
-				return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
-			}
-			digest := fmt.Sprintf("%x", sha256.Sum256(content))
-			if int64(len(content)) == asset.Size && digest == asset.SHA256 {
-				return worker.Reconciliation{State: worker.ReconciliationCommitted, ResourceID: releaseAssetResource(candidate)}, nil
-			}
+		}
+		if committed == len(assets) {
+			return worker.Reconciliation{State: worker.ReconciliationCommitted, ResourceID: resourceID}, nil
+		}
+		if absent == len(assets) {
 			return worker.Reconciliation{State: worker.ReconciliationAbsent}, nil
 		}
-		return worker.Reconciliation{State: worker.ReconciliationAbsent}, nil
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, errors.New("release asset bundle is partially committed")
 	case "repository.create":
 		_, _, ok := splitRepository(request.Repository)
 		visibility, visibilityOK := stringValue(request.Payload, "visibility")
@@ -995,7 +1129,7 @@ func nonNilParents(parents []string) []string {
 	return parents
 }
 
-func releaseAssetPacket(payload map[string]any) (releaseAssetPacketState, []byte, error) {
+func legacyReleaseAssetPacket(payload map[string]any) (releaseAssetPacketState, []byte, error) {
 	tag, tagOK := stringValue(payload, "tag_name")
 	name, nameOK := stringValue(payload, "name")
 	contentType, typeOK := stringValue(payload, "content_type")
@@ -1003,7 +1137,7 @@ func releaseAssetPacket(payload map[string]any) (releaseAssetPacketState, []byte
 	encoded, contentOK := stringValue(payload, "content_base64")
 	size, sizeErr := requiredPositiveInteger(payload, "size")
 	asset := releaseAssetPacketState{TagName: tag, Name: name, ContentType: contentType, SHA256: strings.ToLower(wantSHA), Size: int64(size)}
-	if !tagOK || tag == "" || !nameOK || name == "" || filepath.Base(name) != name || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") || !typeOK || contentType == "" || !shaOK || len(wantSHA) != 64 || !contentOK || sizeErr != nil || size > maxReleaseAssetBytes {
+	if !tagOK || tag == "" || !nameOK || name == "" || filepath.Base(name) != name || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") || !typeOK || contentType == "" || !shaOK || len(wantSHA) != 64 || !contentOK || sizeErr != nil || size > releaseasset.MaxBytes {
 		return releaseAssetPacketState{}, nil, errors.New("release asset packet is incomplete")
 	}
 	for _, character := range strings.ToLower(wantSHA) {
@@ -1022,6 +1156,99 @@ func releaseAssetPacket(payload map[string]any) (releaseAssetPacketState, []byte
 	return asset, content, nil
 }
 
+// releaseAssetDescriptor parses the metadata-only governed packet. The boolean
+// distinguishes a legacy inline packet from a malformed descriptor so already
+// durable legacy operations can drain through their bounded compatibility path.
+func releaseAssetDescriptor(payload map[string]any) (bool, releaseAssetPacketState, error) {
+	raw, present := payload["asset"]
+	if !present {
+		return false, releaseAssetPacketState{}, nil
+	}
+	descriptor, ok := raw.(map[string]any)
+	if !ok || len(payload) != 4 || len(descriptor) != 3 {
+		return true, releaseAssetPacketState{}, errors.New("release asset descriptor is incomplete")
+	}
+	tag, tagOK := stringValue(payload, "tag_name")
+	name, nameOK := stringValue(payload, "name")
+	contentType, typeOK := stringValue(payload, "content_type")
+	stageID, stageOK := stringValue(descriptor, "stage_id")
+	wantSHA, shaOK := stringValue(descriptor, "sha256")
+	size, sizeErr := requiredNonNegativeInteger(descriptor, "size")
+	asset := releaseAssetPacketState{
+		TagName: tag, Name: name, ContentType: contentType, StageID: stageID,
+		SHA256: strings.ToLower(wantSHA), Size: int64(size),
+	}
+	if !tagOK || strings.TrimSpace(tag) == "" || !nameOK || name == "" ||
+		filepath.Base(name) != name || name == "." || name == ".." ||
+		strings.ContainsAny(name, "/\\\x00") || !typeOK ||
+		strings.TrimSpace(contentType) == "" || !stageOK || stageID == "" ||
+		!shaOK || len(wantSHA) != 64 || sizeErr != nil {
+		return true, releaseAssetPacketState{}, errors.New("release asset descriptor is incomplete")
+	}
+	if _, err := hex.DecodeString(asset.SHA256); err != nil {
+		return true, releaseAssetPacketState{}, errors.New("release asset descriptor is incomplete")
+	}
+	return true, asset, nil
+}
+
+func releaseAssetDescriptors(payload map[string]any) ([]releaseAssetPacketState, error) {
+	if len(payload) != 1 {
+		return nil, errors.New("release asset bundle has unexpected fields")
+	}
+	raw, ok := payload["assets"].([]any)
+	if !ok || len(raw) == 0 || len(raw) > 64 {
+		return nil, errors.New("release asset bundle is incomplete")
+	}
+	result := make([]releaseAssetPacketState, 0, len(raw))
+	names, stages := map[string]struct{}{}, map[string]struct{}{}
+	for _, item := range raw {
+		descriptorPayload, ok := item.(map[string]any)
+		if !ok {
+			return nil, errors.New("release asset bundle contains an invalid descriptor")
+		}
+		staged, descriptor, err := releaseAssetDescriptor(descriptorPayload)
+		if err != nil || !staged {
+			return nil, errors.New("release asset bundle contains an invalid descriptor")
+		}
+		if _, duplicate := names[descriptor.Name]; duplicate {
+			return nil, errors.New("release asset bundle contains duplicate names")
+		}
+		if _, duplicate := stages[descriptor.StageID]; duplicate {
+			return nil, errors.New("release asset bundle contains duplicate stages")
+		}
+		names[descriptor.Name], stages[descriptor.StageID] = struct{}{}, struct{}{}
+		result = append(result, descriptor)
+	}
+	return result, nil
+}
+
+func requiredNonNegativeInteger(payload map[string]any, key string) (int, error) {
+	value, ok := payload[key]
+	if !ok {
+		return 0, errors.New("number is required")
+	}
+	switch number := value.(type) {
+	case float64:
+		if number < 0 || number != float64(int(number)) {
+			return 0, errors.New("number is invalid")
+		}
+		return int(number), nil
+	case int:
+		if number < 0 {
+			return 0, errors.New("number is invalid")
+		}
+		return number, nil
+	case json.Number:
+		parsed, err := strconv.Atoi(string(number))
+		if err != nil || parsed < 0 {
+			return 0, errors.New("number is invalid")
+		}
+		return parsed, nil
+	default:
+		return 0, errors.New("number is invalid")
+	}
+}
+
 func (c *Client) releaseUploadURL(template, name string) (string, error) {
 	base := strings.Split(template, "{")[0]
 	parsed, err := c.validReleaseURL(base, true)
@@ -1032,6 +1259,67 @@ func (c *Client) releaseUploadURL(template, name string) (string, error) {
 	query.Set("name", name)
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
+}
+
+func (c *Client) reconcileReleaseAsset(repository string, asset releaseAssetPacketState, mode TokenMode, subject string) (worker.Reconciliation, error) {
+	var release releaseState
+	if err := c.call(http.MethodGet, "/repos/"+repository+"/releases/tags/"+url.PathEscape(asset.TagName), mode, subject, nil, &release); err != nil {
+		if errors.Is(err, ErrGitHubNotFound) {
+			return worker.Reconciliation{State: worker.ReconciliationAbsent}, nil
+		}
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
+	}
+	named := make([]releaseAssetState, 0, len(release.Assets))
+	if release.ID <= 0 {
+		for _, candidate := range release.Assets {
+			if candidate.Name == asset.Name {
+				named = append(named, candidate)
+			}
+		}
+	}
+	for page := 1; release.ID > 0; page++ {
+		var assets []releaseAssetState
+		path := fmt.Sprintf("/repos/%s/releases/%d/assets?per_page=100&page=%d", repository, release.ID, page)
+		if err := c.call(http.MethodGet, path, mode, subject, nil, &assets); err != nil {
+			return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
+		}
+		for _, candidate := range assets {
+			if candidate.Name == asset.Name {
+				named = append(named, candidate)
+			}
+		}
+		if len(assets) < 100 {
+			break
+		}
+	}
+	if len(named) == 0 {
+		return worker.Reconciliation{State: worker.ReconciliationAbsent}, nil
+	}
+	if len(named) != 1 {
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, errors.New("multiple github release assets have the approved name")
+	}
+	candidate := named[0]
+	if candidate.Size != asset.Size || (candidate.State != "" && candidate.State != "uploaded") {
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, errors.New("github release asset name conflicts with approved descriptor")
+	}
+	if candidate.Digest != "" {
+		if candidate.Digest == "sha256:"+asset.SHA256 {
+			return worker.Reconciliation{State: worker.ReconciliationCommitted, ResourceID: releaseAssetResource(candidate)}, nil
+		}
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, errors.New("github release asset digest conflicts with approved descriptor")
+	}
+	downloadURL, err := c.releaseAssetURL(candidate.URL)
+	if err != nil {
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
+	}
+	size, digest, err := c.hashReleaseAssetDownload(downloadURL, mode, subject, asset.Size)
+	if err != nil {
+		return worker.Reconciliation{State: worker.ReconciliationUnknown}, err
+	}
+	if size == asset.Size && digest == asset.SHA256 {
+		return worker.Reconciliation{State: worker.ReconciliationCommitted, ResourceID: releaseAssetResource(candidate)}, nil
+	}
+	return worker.Reconciliation{State: worker.ReconciliationUnknown}, errors.New("github release asset bytes conflict with approved descriptor")
 }
 
 func releaseAssetResource(result releaseAssetState) string {
@@ -1056,6 +1344,9 @@ type releaseAssetState struct {
 	ID                 int64  `json:"id"`
 	Name               string `json:"name"`
 	Size               int64  `json:"size"`
+	ContentType        string `json:"content_type"`
+	State              string `json:"state"`
+	Digest             string `json:"digest"`
 	URL                string `json:"url"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
@@ -1064,6 +1355,7 @@ type releaseAssetPacketState struct {
 	TagName     string
 	Name        string
 	ContentType string
+	StageID     string
 	SHA256      string
 	Size        int64
 }
@@ -1083,5 +1375,3 @@ func (c *Client) validReleaseURL(rawURL string, upload bool) (*url.URL, error) {
 	}
 	return parsed, nil
 }
-
-const maxReleaseAssetBytes = 700 << 10

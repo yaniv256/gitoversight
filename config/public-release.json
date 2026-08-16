@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "release_channel": "prerelease",
+  "plugin": {
+    "path": "plugins/gitoversight"
+  },
+  "cli_artifacts": [
+    {
+      "command": "./cmd/gitoversightctl",
+      "os": "linux",
+      "arch": "amd64",
+      "filename": "gitoversightctl-linux-amd64"
+    },
+    {
+      "command": "./cmd/gitoversightctl",
+      "os": "linux",
+      "arch": "arm64",
+      "filename": "gitoversightctl-linux-arm64"
+    },
+    {
+      "command": "./cmd/gitoversightctl",
+      "os": "darwin",
+      "arch": "amd64",
+      "filename": "gitoversightctl-darwin-amd64"
+    },
+    {
+      "command": "./cmd/gitoversightctl",
+      "os": "darwin",
+      "arch": "arm64",
+      "filename": "gitoversightctl-darwin-arm64"
+    },
+    {
+      "command": "./cmd/gitoversightctl",
+      "os": "windows",
+      "arch": "amd64",
+      "filename": "gitoversightctl-windows-amd64.exe"
+    },
+    {
+      "command": "./cmd/gitoversightctl",
+      "os": "windows",
+      "arch": "arm64",
+      "filename": "gitoversightctl-windows-arm64.exe"
+    }
+  ]
+}

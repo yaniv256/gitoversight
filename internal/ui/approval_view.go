@@ -85,6 +85,16 @@ func buildApprovalView(operation storage.Operation) approvalView {
 		view.Effect = fmt.Sprintf("Opens a new public issue on %s.", operation.Repository)
 		view.Published, view.PublishedLabel = operation.Body, "Issue body"
 		view.ProposedTitle = operation.Title
+	case "release.publish":
+		view.Effect, view.Ref = releasePublishApprovalSummary(operation.Repository, operation.PayloadJSON)
+		view.Published, view.PublishedLabel = operation.Body, "Release notes"
+		view.ProposedTitle = operation.Title
+	case "release.asset.upload":
+		view.Effect = fmt.Sprintf("Uploads a release asset to %s.", operation.Repository)
+		view.Published, view.PublishedLabel = releaseAssetApprovalSummary(operation.PayloadJSON), "Release asset metadata"
+	case "release.assets.upload":
+		view.Effect = fmt.Sprintf("Uploads an exact bundle of release assets to %s.", operation.Repository)
+		view.Published, view.PublishedLabel = releaseAssetsApprovalSummary(operation.PayloadJSON), "Release asset manifest"
 	default:
 		// An unrecognised kind still renders. The generic line says less, but
 		// a page that errors on an unknown operation would block approval of
@@ -100,6 +110,59 @@ func buildApprovalView(operation storage.Operation) approvalView {
 		view.Published, view.PublishedLabel = "", ""
 	}
 	return view
+}
+
+func releaseAssetsApprovalSummary(payload []byte) string {
+	var fields struct {
+		Assets []json.RawMessage `json:"assets"`
+	}
+	if err := json.Unmarshal(payload, &fields); err != nil || len(fields.Assets) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(fields.Assets))
+	for index, asset := range fields.Assets {
+		summary := releaseAssetApprovalSummary(asset)
+		if summary == "" {
+			return ""
+		}
+		parts = append(parts, fmt.Sprintf("Asset %d of %d\n%s", index+1, len(fields.Assets), summary))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func releasePublishApprovalSummary(repository string, payload []byte) (string, string) {
+	var fields struct {
+		TagName         string `json:"tag_name"`
+		TargetCommitish string `json:"target_commitish"`
+		Prerelease      bool   `json:"prerelease"`
+	}
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return fmt.Sprintf("Publishes a release on %s.", repository), ""
+	}
+	releaseKind := "final"
+	if fields.Prerelease {
+		releaseKind = "prerelease"
+	}
+	return fmt.Sprintf("Publishes the %s release %s on %s.", releaseKind, fields.TagName, repository),
+		fmt.Sprintf("Tag: %s · Target commit: %s · Type: %s", fields.TagName, fields.TargetCommitish, releaseKind)
+}
+
+func releaseAssetApprovalSummary(payload []byte) string {
+	var fields struct {
+		TagName     string `json:"tag_name"`
+		Name        string `json:"name"`
+		ContentType string `json:"content_type"`
+		Asset       struct {
+			StageID string `json:"stage_id"`
+			SHA256  string `json:"sha256"`
+			Size    int64  `json:"size"`
+		} `json:"asset"`
+	}
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("Tag: %s\nName: %s\nContent-Type: %s\nSize: %d bytes\nSHA-256: %s\nStage: %s",
+		fields.TagName, fields.Name, fields.ContentType, fields.Asset.Size, fields.Asset.SHA256, fields.Asset.StageID)
 }
 
 // withoutReconciliationMarker strips the HTML comment the worker embeds so it

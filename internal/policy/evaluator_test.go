@@ -176,17 +176,48 @@ func TestRepositoryPermissionsOverrideFallbackRead(t *testing.T) {
 	}
 }
 
-func TestFallbackReadPermissionDoesNotGrantDestructiveWrite(t *testing.T) {
+func TestDerivedRepositoryOwnerReadsWithoutBroadeningOtherAgents(t *testing.T) {
+	snapshot := testPolicy()
+	// The broad fallback for configured repositories must not leak across the
+	// ownership boundary of repositories created dynamically at runtime.
+	snapshot.FallbackPermissions.Read = true
+	snapshot.Repositories["yaniv256/derived"] = policy.Repository{Visibility: "private", Owners: []string{"tomas"}, Derived: true}
+	if decision := policy.Evaluate(snapshot, policy.Request{Caller: "tomas", Repository: "yaniv256/derived", Operation: "repository.read"}); decision.Code != policy.AllowedRead {
+		t.Fatalf("owner read = %s (%s)", decision.Code, decision.Reason)
+	}
+	if decision := policy.Evaluate(snapshot, policy.Request{Caller: "zara", Repository: "yaniv256/derived", Operation: "repository.read"}); decision.Code != policy.ReadDenied {
+		t.Fatalf("unrelated read = %s (%s)", decision.Code, decision.Reason)
+	}
+}
+
+func TestFallbackReadPermissionDoesNotGrantPrivateReleaseWrite(t *testing.T) {
 	t.Parallel()
-	// Read-only fallback permission must not grant a DESTRUCTIVE write. Opening a
-	// branch/PR on a private repo is now allowed for any registered agent
-	// (AllowedPrivateContributor), so this invariant is checked with a destructive
-	// op (release.publish), which still requires human approval.
+	// Read-only fallback permission must not grant release publication to a caller
+	// who is neither an owner nor an authorized writer.
 	snapshot := testPolicy()
 	snapshot.FallbackPermissions = policy.PermissionSet{Read: true}
 	decision := policy.Evaluate(snapshot, policy.Request{Caller: "tomas", Repository: "yaniv256/storage", Operation: "release.publish", Title: "v1", Payload: map[string]any{"tag_name": "v1", "target_commitish": "main", "prerelease": false}})
-	if decision.Code != policy.ApprovalRequired {
-		t.Fatalf("code = %s, want %s (%s)", decision.Code, policy.ApprovalRequired, decision.Reason)
+	if decision.Code != policy.BranchGrantRequired {
+		t.Fatalf("code = %s, want %s (%s)", decision.Code, policy.BranchGrantRequired, decision.Reason)
+	}
+}
+
+func TestPrivateOwnerMayPublishReleaseAndAssetsWithoutApproval(t *testing.T) {
+	t.Parallel()
+	snapshot := testPolicy()
+	for _, operation := range []string{"release.publish", "release.asset.upload"} {
+		decision := policy.Evaluate(snapshot, policy.Request{
+			Caller: "zara", Repository: "yaniv256/private", Operation: operation,
+		})
+		if decision.Code != policy.Allowed {
+			t.Fatalf("%s private code = %s, want %s (%s)", operation, decision.Code, policy.Allowed, decision.Reason)
+		}
+		decision = policy.Evaluate(snapshot, policy.Request{
+			Caller: "zara", Repository: "yaniv256/public.bare", Operation: operation,
+		})
+		if decision.Code != policy.ApprovalRequired {
+			t.Fatalf("%s public code = %s, want %s (%s)", operation, decision.Code, policy.ApprovalRequired, decision.Reason)
+		}
 	}
 }
 
@@ -244,6 +275,9 @@ func TestEvaluatePolicyMatrix(t *testing.T) {
 		{"private review missing signature", policy.Request{Caller: "tomas", Repository: "yaniv256/private", Operation: "pull_request.review", Body: "Looks good."}, policy.PrivateAttributionRequired},
 		{"public agent signature denied", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "pull_request.create", Title: "Docs", Body: "Ready.\n\n— Zara"}, policy.PublicIdentityLeak},
 		{"public payload agent identity denied", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "pull_request.create", Title: "Docs", Payload: map[string]any{"commit_message": "Co-authored-by: Zara <zara@example.com>"}}, policy.PublicIdentityLeak},
+		{"public packet encoded blob coincidence is not attribution", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "branch.push", Branch: "feature/change", Payload: map[string]any{"object_package": map[string]any{"blobs": []any{map[string]any{"sha": "d7c6b25ea1bc0028201ab05b2e84044f6f294566", "encoding": "base64", "content": "/9j/4AAQZarAAB"}}}}}, policy.AllowedStanding},
+		{"public packet commit attribution still denied", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "branch.push", Branch: "feature/change", Payload: map[string]any{"object_package": map[string]any{"commit": map[string]any{"committer": map[string]any{"name": "Zara", "email": "zara@example.com"}}}}}, policy.PublicIdentityLeak},
+		{"public non-base64 content attribution still denied", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "branch.push", Branch: "feature/change", Payload: map[string]any{"sha": "d7c6b25ea1bc0028201ab05b2e84044f6f294566", "encoding": "utf-8", "content": "Authored by Zara"}}, policy.PublicIdentityLeak},
 		{"public branch agent identity denied", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "pull_request.create", Branch: "zara/feature", Title: "Docs"}, policy.PublicIdentityLeak},
 		{"public prose agent identity denied", policy.Request{Caller: "zara", Repository: "yaniv256/public", Operation: "pull_request.create", Title: "Authored by Zara"}, policy.PublicIdentityLeak},
 		{"protected policy always approval", policy.Request{Caller: "zara", Repository: "yaniv256/gitoversight.authorization", Operation: "branch.push", Branch: "policy"}, policy.ApprovalRequired},
@@ -278,6 +312,38 @@ func TestDuplicateUIDsRejected(t *testing.T) {
 	snapshot.Agents["tomas"] = policy.Agent{UID: 1002, FirstName: "Tomas"}
 	if err := snapshot.Validate(); err == nil {
 		t.Fatal("expected duplicate UID rejection")
+	}
+}
+
+func TestLegacyAndExplicitLocalAgentsRetainUniqueUIDSemantics(t *testing.T) {
+	t.Parallel()
+	snapshot := testPolicy()
+	snapshot.Agents["tomas"] = policy.Agent{Kind: policy.AgentKindLocal, UID: 1002, FirstName: "Tomas"}
+	if err := snapshot.Validate(); err == nil || !strings.Contains(err.Error(), "share uid") {
+		t.Fatalf("expected local uid collision, got %v", err)
+	}
+}
+
+func TestRemoteAgentsHaveNoUnixUIDAndDoNotCollide(t *testing.T) {
+	t.Parallel()
+	snapshot := testPolicy()
+	snapshot.Agents["work-one"] = policy.Agent{Kind: policy.AgentKindRemote, FirstName: "Work One"}
+	snapshot.Agents["work-two"] = policy.Agent{Kind: policy.AgentKindRemote, FirstName: "Work Two"}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("remote agents with uid zero should validate: %v", err)
+	}
+	snapshot.Agents["work-two"] = policy.Agent{Kind: policy.AgentKindRemote, UID: 2000, FirstName: "Work Two"}
+	if err := snapshot.Validate(); err == nil || !strings.Contains(err.Error(), "must not declare a unix uid") {
+		t.Fatalf("expected remote unix uid rejection, got %v", err)
+	}
+}
+
+func TestUnknownAgentKindRejected(t *testing.T) {
+	t.Parallel()
+	snapshot := testPolicy()
+	snapshot.Agents["work"] = policy.Agent{Kind: policy.AgentKind("browser"), FirstName: "Work"}
+	if err := snapshot.Validate(); err == nil || !strings.Contains(err.Error(), "invalid kind") {
+		t.Fatalf("expected invalid kind rejection, got %v", err)
 	}
 }
 

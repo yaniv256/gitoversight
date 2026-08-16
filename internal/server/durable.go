@@ -32,17 +32,19 @@ const (
 )
 
 var (
-	ErrDurableNotFound  = errors.New("durable operation not found")
-	ErrDurableForbidden = errors.New("durable operation is not visible to caller")
-	ErrDurableApproval  = errors.New("durable approval rejected")
-	ErrDurableInvalid   = errors.New("durable request is invalid")
-	ErrDurableState     = errors.New("durable operation state does not permit this action")
-	ErrDurablePolicy    = errors.New("durable policy promotion rejected")
+	ErrDurableNotFound       = errors.New("durable operation not found")
+	ErrDurableForbidden      = errors.New("durable operation is not visible to caller")
+	ErrDurableApproval       = errors.New("durable approval rejected")
+	ErrDurableInvalid        = errors.New("durable request is invalid")
+	ErrDurableState          = errors.New("durable operation state does not permit this action")
+	ErrDurablePolicy         = errors.New("durable policy promotion rejected")
+	ErrStreamedAssetRequired = errors.New("streamed release asset required")
 )
 
 type DurableIdentity struct {
-	TenantID string
-	AgentID  string
+	TenantID     string
+	AgentID      string
+	CredentialID string
 }
 
 type DurableOperationRequest struct {
@@ -79,6 +81,10 @@ type DurableResult struct {
 	AgentID          string       `json:"agent_id"`
 	Repository       string       `json:"repository"`
 	Operation        string       `json:"operation"`
+	Branch           string       `json:"branch,omitempty"`
+	Title            string       `json:"title,omitempty"`
+	HeadSHA          string       `json:"head_sha,omitempty"`
+	ManifestHash     string       `json:"manifest_hash,omitempty"`
 	State            DurableState `json:"state"`
 	Decision         policy.Code  `json:"decision"`
 	Reason           string       `json:"reason"`
@@ -98,6 +104,18 @@ type DurablePolicyStatus struct {
 	Generation  uint64    `json:"generation"`
 	PolicyHash  string    `json:"policy_hash"`
 	ActivatedAt time.Time `json:"activated_at"`
+}
+
+// WorkAgentEnrollment is the human-reviewed policy portion of a remote Work
+// enrollment. RepositoryScope is persisted by the OAuth grant; policy only
+// registers the agent, preserving the existing repository authority rules.
+type WorkAgentEnrollment struct {
+	AgentID            string
+	DisplayName        string
+	RepositoryScope    []string
+	AllPrivate         bool
+	ExpectedGeneration uint64
+	ExpectedPolicyHash string
 }
 
 type DurableExecutionPacket struct {
@@ -464,6 +482,86 @@ func (broker *DurableBroker) PromotePolicy(ctx context.Context, tenantID, approv
 	return broker.installPolicy(ctx, tenantID, snapshot, approver, expectedHash)
 }
 
+// EnrollWorkAgent registers one remote agent through the same durable,
+// generation-bound policy promotion path used for human-reviewed policy
+// changes. It deliberately adds no repository writer or owner grants.
+func (broker *DurableBroker) EnrollWorkAgent(ctx context.Context, tenantID, approver string, enrollment WorkAgentEnrollment) (DurablePolicyStatus, error) {
+	if broker == nil || broker.db == nil || tenantID == "" || approver == "" ||
+		enrollment.AgentID == "" || enrollment.DisplayName == "" ||
+		enrollment.AgentID != strings.TrimSpace(enrollment.AgentID) ||
+		enrollment.DisplayName != strings.TrimSpace(enrollment.DisplayName) ||
+		enrollment.ExpectedGeneration == 0 || enrollment.ExpectedPolicyHash == "" {
+		return DurablePolicyStatus{}, fmt.Errorf("%w: work enrollment binding is incomplete", ErrDurableInvalid)
+	}
+	if enrollment.AllPrivate == (len(enrollment.RepositoryScope) > 0) {
+		return DurablePolicyStatus{}, fmt.Errorf("%w: choose either all private repositories or an exact repository scope", ErrDurableInvalid)
+	}
+
+	status, err := broker.PolicyStatus(ctx, tenantID)
+	if err != nil {
+		return DurablePolicyStatus{}, err
+	}
+	if status.Generation != enrollment.ExpectedGeneration || status.PolicyHash != enrollment.ExpectedPolicyHash {
+		return DurablePolicyStatus{}, fmt.Errorf("%w: active generation does not match reviewed predecessor", ErrDurablePolicy)
+	}
+	current, err := broker.policy(ctx, tenantID)
+	if err != nil {
+		return DurablePolicyStatus{}, err
+	}
+	if _, exists := current.Agents[enrollment.AgentID]; exists {
+		return DurablePolicyStatus{}, fmt.Errorf("%w: agent identity %q is already registered", ErrDurableInvalid, enrollment.AgentID)
+	}
+
+	seenRepositories := make(map[string]struct{}, len(enrollment.RepositoryScope))
+	for _, repositoryName := range enrollment.RepositoryScope {
+		if repositoryName == "" || repositoryName != strings.TrimSpace(repositoryName) {
+			return DurablePolicyStatus{}, fmt.Errorf("%w: repository scope must contain exact names", ErrDurableInvalid)
+		}
+		if _, duplicate := seenRepositories[repositoryName]; duplicate {
+			return DurablePolicyStatus{}, fmt.Errorf("%w: repository scope contains duplicate %q", ErrDurableInvalid, repositoryName)
+		}
+		seenRepositories[repositoryName] = struct{}{}
+		repository, exists := current.Repositories[repositoryName]
+		if !exists {
+			return DurablePolicyStatus{}, fmt.Errorf("%w: repository %q is not registered", ErrDurableInvalid, repositoryName)
+		}
+		if repository.Visibility != "private" {
+			return DurablePolicyStatus{}, fmt.Errorf("%w: repository %q is not private", ErrDurableInvalid, repositoryName)
+		}
+	}
+
+	next := clonePolicySnapshot(current)
+	next.Generation = current.Generation + 1
+	next.Agents[enrollment.AgentID] = policy.Agent{Kind: policy.AgentKindRemote, FirstName: enrollment.DisplayName}
+	if err := broker.PromotePolicy(ctx, tenantID, approver, enrollment.ExpectedGeneration, enrollment.ExpectedPolicyHash, next); err != nil {
+		return DurablePolicyStatus{}, err
+	}
+	return broker.PolicyStatus(ctx, tenantID)
+}
+
+func clonePolicySnapshot(snapshot policy.Snapshot) policy.Snapshot {
+	clone := snapshot
+	clone.Agents = make(map[string]policy.Agent, len(snapshot.Agents)+1)
+	for name, agent := range snapshot.Agents {
+		agent.Emails = append([]string(nil), agent.Emails...)
+		clone.Agents[name] = agent
+	}
+	clone.Repositories = make(map[string]policy.Repository, len(snapshot.Repositories))
+	for name, repository := range snapshot.Repositories {
+		repository.Owners = append([]string(nil), repository.Owners...)
+		repository.Writers = append([]string(nil), repository.Writers...)
+		repository.Approvers = append([]string(nil), repository.Approvers...)
+		repository.Standing = append([]string(nil), repository.Standing...)
+		if repository.Permissions != nil {
+			permissions := *repository.Permissions
+			repository.Permissions = &permissions
+		}
+		clone.Repositories[name] = repository
+	}
+	clone.BranchGrants = append([]policy.BranchGrant(nil), snapshot.BranchGrants...)
+	return clone
+}
+
 func (broker *DurableBroker) installPolicy(ctx context.Context, tenantID string, snapshot policy.Snapshot, approver, previousHash string) error {
 	if broker == nil || broker.db == nil || tenantID == "" {
 		return errors.New("durable broker and tenant are required")
@@ -530,6 +628,24 @@ func (broker *DurableBroker) PolicyStatus(ctx context.Context, tenantID string) 
 	return DurablePolicyStatus{TenantID: generation.TenantID, Generation: generation.Generation, PolicyHash: generation.PolicyHash, ActivatedAt: generation.ActivatedAt}, nil
 }
 
+// PolicySnapshot returns the active validated snapshot for adapters that must
+// intersect a narrower credential scope with current policy state.
+func (broker *DurableBroker) PolicySnapshot(ctx context.Context, tenantID string) (policy.Snapshot, error) {
+	if broker == nil || broker.db == nil || tenantID == "" {
+		return policy.Snapshot{}, ErrDurableInvalid
+	}
+	return broker.policy(ctx, tenantID)
+}
+
+func (broker *DurableBroker) ResolveRepository(ctx context.Context, tenantID, repository string) (policy.Repository, bool, error) {
+	snapshot, err := broker.policy(ctx, tenantID)
+	if err != nil {
+		return policy.Repository{}, false, err
+	}
+	value, ok := snapshot.Repositories[repository]
+	return value, ok, nil
+}
+
 func (broker *DurableBroker) Submit(ctx context.Context, identity DurableIdentity, request DurableOperationRequest) (DurableResult, error) {
 	if broker == nil || broker.db == nil || identity.TenantID == "" || identity.AgentID == "" || request.ID == "" {
 		return DurableResult{}, fmt.Errorf("%w: operation identity and id are required", ErrDurableInvalid)
@@ -544,6 +660,41 @@ func (broker *DurableBroker) Submit(ctx context.Context, identity DurableIdentit
 	}
 	if err := broker.verifyWrite(); err != nil {
 		return DurableResult{}, err
+	}
+	var stagedAssets []storage.StagedAsset
+	if request.Operation == "release.asset.upload" {
+		if err := rejectNewInlineReleaseAsset(request.Payload); err != nil {
+			return DurableResult{}, err
+		}
+		if identity.CredentialID == "" {
+			return DurableResult{}, fmt.Errorf("%w: release asset credential binding is required", ErrDurableInvalid)
+		}
+		descriptor, err := parseReleaseAssetDescriptor(request.Payload)
+		if err != nil {
+			return DurableResult{}, err
+		}
+		stagedAssets = append(stagedAssets, storage.StagedAsset{
+			TenantID: identity.TenantID, ID: descriptor.StageID, AgentID: identity.AgentID,
+			CredentialID: identity.CredentialID, Repository: request.Repository,
+			Name: descriptor.Name, ContentType: descriptor.ContentType,
+			ExpectedSHA256: descriptor.SHA256, ExpectedSize: descriptor.Size,
+		})
+	} else if request.Operation == "release.assets.upload" {
+		if identity.CredentialID == "" {
+			return DurableResult{}, fmt.Errorf("%w: release asset credential binding is required", ErrDurableInvalid)
+		}
+		descriptors, err := parseReleaseAssetDescriptors(request.Payload)
+		if err != nil {
+			return DurableResult{}, err
+		}
+		for _, descriptor := range descriptors {
+			stagedAssets = append(stagedAssets, storage.StagedAsset{
+				TenantID: identity.TenantID, ID: descriptor.StageID, AgentID: identity.AgentID,
+				CredentialID: identity.CredentialID, Repository: request.Repository,
+				Name: descriptor.Name, ContentType: descriptor.ContentType,
+				ExpectedSHA256: descriptor.SHA256, ExpectedSize: descriptor.Size,
+			})
+		}
 	}
 	snapshot, err := broker.policy(ctx, identity.TenantID)
 	if err != nil {
@@ -560,6 +711,16 @@ func (broker *DurableBroker) Submit(ctx context.Context, identity DurableIdentit
 	state, actorMode, actorSubject := DurableDenied, "", ""
 	if durableAllowed(decision.Code) {
 		state, actorMode = DurableAuthorized, ActorAppInstallation
+		// For a private repository in an enrolled human's namespace, an owner
+		// operation may use that owner's vaulted user token without a new human
+		// interaction. This keeps newly-created repositories operable before the
+		// GitHub App installation can discover or select them, while the durable
+		// packet still binds the exact repository, operation, and payload.
+		if decision.Code == policy.Allowed {
+			if humanID, ok := humanForRepositoryOwner(broker.humanLogins, request.Repository); ok {
+				actorMode, actorSubject = ActorHumanUser, humanID
+			}
+		}
 		// GitHub only lets a USER token create a user-owned repository, so an
 		// allowed (private-scope) create executes as the enrolled human whose
 		// GitHub login owns the target namespace. Actor subjects are governance
@@ -606,6 +767,13 @@ func (broker *DurableBroker) Submit(ctx context.Context, identity DurableIdentit
 		if err := tx.PutOperation(ctx, record); err != nil {
 			return err
 		}
+		if state == DurableAuthorized || state == DurableAwaitingApproval {
+			for _, stagedAsset := range stagedAssets {
+				if err := tx.PinStagedAsset(ctx, stagedAsset, request.ID, now); err != nil {
+					return err
+				}
+			}
+		}
 		event := map[string]any{"state": state, "decision": decision.Code, "packet_hash": packetHash}
 		if err := tx.AppendAuthorityTransition(ctx, identity.TenantID, request.ID+":submitted", "operation_submitted", request.ID, event, now); err != nil {
 			return err
@@ -630,6 +798,9 @@ func (broker *DurableBroker) Submit(ctx context.Context, identity DurableIdentit
 			return DurableResult{}, lookupErr
 		}
 		return DurableResult{ID: request.ID, TenantID: identity.TenantID, AgentID: identity.AgentID, State: DurableDenied, Decision: ReplayDenied, Reason: "operation uniqueness was already consumed", NextAction: "stop"}, nil
+	}
+	if errors.Is(err, storage.ErrStagedAssetState) {
+		return DurableResult{}, fmt.Errorf("%w: staged release asset is unavailable or does not match the operation", ErrDurableInvalid)
 	}
 	if err != nil {
 		return DurableResult{}, err
@@ -871,6 +1042,25 @@ func (broker *DurableBroker) policy(ctx context.Context, tenantID string) (polic
 	if snapshot.Generation != generation.Generation {
 		return policy.Snapshot{}, errors.New("stored policy generation mismatch")
 	}
+	digest := sha256.Sum256(generation.SnapshotJSON)
+	if generation.PolicyHash != hex.EncodeToString(digest[:]) {
+		return policy.Snapshot{}, errors.New("stored policy hash mismatch")
+	}
+	derived, err := broker.db.DerivedRepositories(ctx, tenantID)
+	if err != nil {
+		return policy.Snapshot{}, err
+	}
+	for _, item := range derived {
+		if _, configured := snapshot.Repositories[item.Repository]; configured {
+			continue
+		}
+		snapshot.Repositories[item.Repository] = policy.Repository{
+			Visibility:   item.Visibility,
+			Owners:       []string{item.OwnerAgentID},
+			Derived:      true,
+			ActorSubject: item.ActorSubject,
+		}
+	}
 	return snapshot, snapshot.Validate()
 }
 
@@ -902,6 +1092,7 @@ func durableResult(operation storage.Operation) DurableResult {
 	return DurableResult{
 		ID: operation.ID, TenantID: operation.TenantID, AgentID: operation.AgentID,
 		Repository: operation.Repository, Operation: operation.Kind, State: DurableState(operation.State),
+		Branch: operation.Branch, Title: operation.Title, HeadSHA: operation.HeadSHA, ManifestHash: operation.ManifestHash,
 		Decision: policy.Code(operation.DecisionCode), Reason: operation.Reason, PacketHash: operation.PacketHash,
 		PolicyGeneration: operation.PolicyGeneration, ActorMode: operation.ActorMode, ActorSubject: operation.ActorSubject,
 		ResourceID: operation.ResourceID,

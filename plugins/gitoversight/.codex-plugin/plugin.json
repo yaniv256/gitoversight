@@ -1,0 +1,41 @@
+{
+  "name": "gitoversight",
+  "version": "0.1.0",
+  "description": "Govern private GitHub work through agent-scoped GitOversight policy while keeping public effects behind meaningful human review.",
+  "author": {
+    "name": "GitOversight",
+    "url": "https://gitoversight.com/"
+  },
+  "homepage": "https://gitoversight.com/",
+  "repository": "https://github.com/yaniv256/gitoversight",
+  "license": "MIT",
+  "keywords": [
+    "gitoversight",
+    "github",
+    "governance",
+    "private-repositories",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "GitOversight",
+    "shortDescription": "Govern agent work on private GitHub repositories",
+    "longDescription": "Inspect authorized private repositories, prepare bounded changes, publish through policy, reconcile uncertain outcomes, and prepare public pre-PR reviews without sharing GitHub credentials.",
+    "developerName": "GitOversight",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://gitoversight.com/",
+    "defaultPrompt": [
+      "List the private repositories this agent may access",
+      "Prepare and preview a bounded private change",
+      "Check or reconcile a GitOversight operation"
+    ],
+    "brandColor": "#172554",
+    "screenshots": []
+  }
+}

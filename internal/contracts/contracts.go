@@ -28,7 +28,7 @@ var knownOperations = map[string]struct{}{
 	"pull_request.review": {}, "pull_request.reply": {}, "pull_request.merge": {}, "pull_request.close": {},
 	"repository.read": {}, "repository.create": {}, "repository.settings.update": {}, "installation.repository.add": {}, "policy.promote": {},
 	"sync.propose": {}, "sync.update": {}, "queue.set_order": {},
-	"release.publish": {}, "release.asset.upload": {}, "issue.create": {}, "issue.comment": {},
+	"release.publish": {}, "release.asset.upload": {}, "release.assets.upload": {}, "issue.create": {}, "issue.comment": {},
 }
 
 type requestDocument struct {
